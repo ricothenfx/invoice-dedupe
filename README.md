@@ -25,7 +25,10 @@ blocking, and contextual rules — with a review queue for the gray zone.
 | Duplicate value caught | **$7.36M** |
 
 Re-verified unchanged after Phase 2 (service/ingestion layer added; detection engine
-untouched).
+untouched) and after Phase 3 (web app added; detection engine untouched). The same
+numbers render live in the web app dashboard after
+`invoice-dedupe seed-demo --n 10000 --seed 42` (measured precision @ 0.90: 0.9852,
+recall 1.0000, 203 flagged pairs, $7.37M exposure).
 
 Recall per duplicate variant (all 100%): `format`, `confusion`, `vendor_variant`,
 `reinvoice` (vendor resubmits with a brand-new number — the hardest and most expensive
@@ -90,7 +93,7 @@ invoice-dedupe evaluate --dataset datasets/invoices.jsonl --pairs datasets/pairs
 pytest
 ```
 
-### Service mode (Phase 2)
+### Service mode (Phase 2) and web app (Phase 3)
 
 ```bash
 # 1. PostgreSQL (any instance works; default DSN below, override with DEDUPE_DATABASE_URL)
@@ -98,9 +101,10 @@ docker run -d --name invoice-dedupe-postgres \
   -e POSTGRES_USER=invoice_dedupe -e POSTGRES_PASSWORD=invoice_dedupe \
   -e POSTGRES_DB=invoice_dedupe -p 127.0.0.1:5433:5432 postgres:16-alpine
 
-# 2. schema, API, worker
+# 2. schema, demo data, API, worker
 invoice-dedupe init-db
-invoice-dedupe serve --port 8000        # terminal 1
+invoice-dedupe seed-demo --n 10000 --seed 42   # synthetic dataset + ground truth, runs detection
+invoice-dedupe serve --port 8000        # terminal 1 — then open http://127.0.0.1:8000
 invoice-dedupe worker                   # terminal 2
 
 # 3. upload a text-layer PDF; the worker extracts + detects asynchronously
@@ -109,10 +113,25 @@ curl -F "file=@sample.pdf;type=application/pdf" http://127.0.0.1:8000/invoices/p
 curl http://127.0.0.1:8000/pairs?label=flag
 ```
 
-API: `GET /health` · `POST /invoices/pdf` · `GET /jobs/{id}` · `GET /invoices` ·
-`GET /invoices/{id}` · `GET /pairs?label=flag|review|pass` ·
-`POST /pairs/{a}/{b}/decision`. Raw extraction text is stored per invoice
-(`GET /invoices/{id}`) separately from the parsed fields.
+The web app (served at `/`, fully offline — assets vendored, no CDN):
+
+- **Dashboard** — flag-threshold slider with live flagged count, precision and
+  recall (measured against the seeded ground truth, or estimated from your review
+  decisions when no ground truth is loaded), double-payment exposure, threshold
+  curves, and the pair score histogram.
+- **Review queue** — side-by-side pair comparisons with the per-field score
+  breakdown (invoice no / vendor / amount / date, tax-ID and rule chips).
+  Keyboard triage: `j`/`k` navigate, `d` = duplicate, `n` = not a duplicate;
+  every verdict is persisted and the cursor auto-advances, so 100 flagged pairs
+  take minutes.
+- **Invoices** — paginated list with extraction confidence and duplicate-variant
+  badges. **Upload** — drag & drop PDFs with live job progress.
+
+API: `GET /` (web app) · `GET /health` · `POST /invoices/pdf` · `GET /jobs/{id}` ·
+`GET /invoices` · `GET /invoices/{id}` · `GET /pairs?label=flag|review|pass&undecided=`
+(enriched with both invoices + decision) · `POST /pairs/{a}/{b}/decision` ·
+`GET /metrics?flag_threshold=` (dashboard payload). Raw extraction text is stored
+per invoice (`GET /invoices/{id}`) separately from the parsed fields.
 
 ## Layout
 
@@ -125,18 +144,20 @@ src/invoice_dedupe/
   synth.py       synthetic dataset generator + 5 duplicate variant classes (ground truth)
   evaluate.py    precision/recall/F1, threshold sweep, per-variant recall
   dataset.py     JSONL I/O
-  cli.py         generate / run / evaluate / demo / init-db / serve / worker / make-pdf
+  cli.py         generate / run / evaluate / demo / init-db / seed-demo / serve / worker / make-pdf
   extraction.py  pdfplumber text-layer extraction + label-based field parser
   pdfgen.py      dependency-free text-layer PDF writer (demo/test fixtures)
   db.py          PostgreSQL persistence (invoices, pairs, review decisions, jobs)
+  metrics.py     dashboard threshold metrics (measured + decision-based precision)
   worker.py      job queue consumer (extraction + detection)
-  api.py         FastAPI service
+  api.py         FastAPI service + web app hosting
+  webapp/        React review app (vendored UMD builds, no build step, offline)
 ```
 
 ## Roadmap
 
-- **Phase 2**: FastAPI service + PDF ingestion (pdfplumber) + PostgreSQL + worker queue
-- **Phase 3**: Interactive review-queue web app (React) with per-field score breakdown
+- ~~**Phase 2**: FastAPI service + PDF ingestion (pdfplumber) + PostgreSQL + worker queue~~ (done)
+- ~~**Phase 3**: Interactive review-queue web app with per-field score breakdown~~ (done)
 - **Phase 4**: Vision-LLM extraction fallback for scans/photos + feedback loop
   (threshold tuning and weight adjustment from reviewer decisions)
 

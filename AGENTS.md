@@ -29,7 +29,8 @@ the project documents below, never on prior chat history.**
   status is recorded at the bottom of the charter.
 - **Dependencies**: runtime dependencies stay minimal (`rapidfuzz` for the engine; Phase 2
   added `fastapi`, `uvicorn`, `pdfplumber`, `psycopg`, `python-multipart` for the service
-  layer). Adding one requires a decision-log entry with justification.
+  layer; Phase 3 added **none** — the web app vendors React UMD assets, see the decision
+  log). Adding one requires a decision-log entry with justification.
 - **Honesty over hype**: report precision/recall including false positives and describe
   known limitations. Planted *hard negatives* (recurring invoices) stay in the dataset.
 
@@ -43,7 +44,8 @@ invoice-dedupe generate --n 10000 --seed 42 --out datasets   # write dataset + m
 invoice-dedupe run --dataset datasets/invoices.jsonl --out datasets/pairs.jsonl
 invoice-dedupe evaluate --dataset datasets/invoices.jsonl --pairs datasets/pairs.jsonl
 invoice-dedupe init-db                                       # create PostgreSQL schema
-invoice-dedupe serve                                         # run the FastAPI service
+invoice-dedupe seed-demo                                     # load synthetic demo data (+ GT) for the web app
+invoice-dedupe serve                                         # run the FastAPI service (+ web app at /)
 invoice-dedupe worker                                        # run the job worker
 invoice-dedupe make-pdf --out sample.pdf                     # sample text-layer invoice PDF
 ```
@@ -57,8 +59,8 @@ are skipped when it is unset.
 
 ```
 src/invoice_dedupe/   engine package (normalize, scoring, blocking, engine, synth,
-                      evaluate, dataset, cli, models) + service layer (extraction,
-                      pdfgen, db, worker, api)
+                      evaluate, dataset, cli, models, metrics) + service layer
+                      (extraction, pdfgen, db, worker, api, webapp/)
 tests/                pytest suite (integration tests need DEDUPE_TEST_DATABASE_URL)
 docs/                 PROJECT_CHARTER.md, DESIGN.md
 datasets/             generated artifacts (git-ignored)

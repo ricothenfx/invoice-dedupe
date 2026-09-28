@@ -143,13 +143,13 @@ Parser rules:
   are listed explicitly. Known limitation (honest, by design): the label parser covers
   structured invoice documents; arbitrary layouts need the Phase 4 fallback.
 
-## 7. Service architecture (Phase 2)
+## 7. Service architecture (Phase 2, web app in Phase 3)
 
 ```
 ┌─────────┐  POST /invoices/pdf   ┌──────────┐  jobs table   ┌────────┐
 │ client  │ ────────────────────► │ FastAPI  │ ────────────► │ worker │
-└─────────┘                       │  (api)   │               │(worker)│
-                                  └────┬─────┘               └───┬────┘
+│ (web UI)│ ◄───── JSON API ──────│  (api)   │               │(worker)│
+└─────────┘                       └────┬─────┘               └───┬────┘
                                        │        PostgreSQL       │ pdfplumber
                                        │  ┌──────────────────┐   │ engine.detect
                                        └─►│ invoices         │◄──┘
@@ -161,9 +161,11 @@ Parser rules:
 
 - **API** (`api.py`): `GET /health`, `POST /invoices/pdf` (multipart, validated
   `%PDF-` magic, ≤10 MiB, returns `202` + job id), `GET /jobs/{id}`, `GET /invoices`,
-  `GET /invoices/{id}` (includes raw extraction text), `GET /pairs?label=`, and
-  `POST /pairs/{a}/{b}/decision` (persists reviewer verdicts for the Phase 4 loop).
-  Uploads are asynchronous by design: the API only validates and enqueues.
+  `GET /invoices/{id}` (includes raw extraction text), `GET /pairs?label=&undecided=`
+  (enriched with both invoices' fields and the stored review decision — the review
+  queue renders from this single request), and `POST /pairs/{a}/{b}/decision`
+  (persists reviewer verdicts for the Phase 4 loop). Uploads are asynchronous by
+  design: the API only validates and enqueues.
 - **Worker** (`worker.py`): claims jobs from the `jobs` table with
   `SELECT … FOR UPDATE SKIP LOCKED` (safe with multiple workers), runs
   `extract_pdf` (extract → insert invoice with raw text → enqueue `detect`) and
@@ -173,6 +175,51 @@ Parser rules:
 - **Persistence** (`db.py`): plain SQL via psycopg 3. Raw extraction text lives in
   `invoices.raw_text`, separate from the parsed columns, so extraction can improve
   without invalidating audit trails (charter §4).
+
+### 7.1 Web app (Phase 3)
+
+The interactive review app is a single-page React application served by the same
+FastAPI process from `src/invoice_dedupe/webapp/` (`GET /` returns `index.html`,
+assets under `/static/`). Tabs:
+
+- **Dashboard** (`GET /metrics`): totals (invoices, flagged/review/pass counts,
+  decisions), a flag-threshold slider with live recomputed numbers, threshold
+  curves, and the pair score histogram (true duplicates stacked against other
+  candidates).
+- **Review queue** (`GET /pairs`): pairs sorted by score, each rendered as a
+  side-by-side comparison of both invoices with per-field score breakdown
+  (invoice number 0.35 / vendor 0.25 / amount 0.30 / date 0.10, tax-ID chip,
+  rule chip). Reviewer verdicts post to `POST /pairs/{a}/{b}/decision`;
+  keyboard triage (`j`/`k` navigate, `d` duplicate, `n` not-a-duplicate) with
+  auto-advance to the next undecided pair is what makes "100 flagged pairs in
+  minutes" feasible.
+- **Invoices** (`GET /invoices`): paginated table with extraction confidence and
+  duplicate-variant badges.
+- **Upload**: drop a text-layer PDF, polls `GET /jobs/{id}` until extraction and
+  chained detection finish, reports confidence and missing fields.
+
+`GET /metrics?flag_threshold=t` returns, in one payload:
+
+- `label_counts`, `decisions`, `n_invoices`, `n_gt_pairs` (ground-truth
+  duplicates known, or `null`);
+- `at_threshold` — the server-computed, unit-tested numbers at `t`
+  (`metrics.threshold_metrics`): flagged count, double-payment exposure
+  (`value_at_risk`, the larger amount of each flagged pair), measured
+  precision/recall when ground truth exists, and a decision-based precision
+  estimate otherwise;
+- `distribution` — one row per scored pair (`score`, `gt` flag, exposure,
+  decision), so the UI recomputes the slider position live without refetching.
+
+Precision signal precedence (honest by design): **measured** against seeded
+ground truth when available (`seed-demo` loads the synthetic GT into nullable
+`invoices.duplicate_of`/`variant` columns); else **estimated** from review
+decisions at/above the threshold (confirmed ÷ decided, only when at least one
+decision exists); else explicitly "no signal yet".
+
+`invoice-dedupe seed-demo --n 10000 --seed 42` generates the synthetic dataset,
+bulk-inserts it with ground truth, and runs detection synchronously, so the app
+has a realistic review queue (203 flagged / 483 review pairs) within seconds —
+no hand-crafted PDFs needed, fully offline.
 
 ## 8. Data model
 
@@ -186,11 +233,14 @@ PairResult       id_a, id_b, score, label, breakdown (per-field similarities + r
 ```
 
 Phase 2 (PostgreSQL): `invoices` (parsed columns + `raw_text`,
-`extraction_method`, `extraction_confidence`), `invoice_pairs`
-(`score`, `label`, `breakdown` JSONB), `review_decisions` (`duplicate` /
-`not_duplicate`, feeds Phase 4), `jobs` (`extract_pdf` / `detect`, statuses
-`pending → running → done|failed`). `review_decisions` currently records
-verdicts; acting on them (threshold tuning) is Phase 4.
+`extraction_method`, `extraction_confidence`; Phase 3 adds nullable
+`duplicate_of` / `variant` ground-truth columns, populated only by
+`seed-demo`), `invoice_pairs` (`score`, `label`, `breakdown` JSONB),
+`review_decisions` (`duplicate` / `not_duplicate`, feeds Phase 4), `jobs`
+(`extract_pdf` / `detect`, statuses `pending → running → done|failed`).
+`review_decisions` currently records verdicts; acting on them (threshold
+tuning) is Phase 4. Phase 3 reads these tables read-only through
+`GET /metrics` and the enriched `GET /pairs`.
 
 ## 9. Decision log
 
@@ -211,3 +261,7 @@ verdicts; acting on them (threshold tuning) is Phase 4.
 | 2026-09-28 | Dependency-free minimal PDF writer (`pdfgen.py`) instead of a PDF-generation library | Demos and tests need text-layer fixture PDFs; a 60-line writer avoids a dev/runtime dependency and is verified round-trip through pdfplumber. |
 | 2026-09-28 | Conservative label-based field parser with per-invoice extraction confidence | Guessing fields would corrupt the matching engine's input and the audit trail. Missing fields are reported (`missing` list + confidence), and the vision-LLM fallback for layouts without labels is explicitly Phase 4 (charter D6). |
 | 2026-09-28 | `detect` job recomputes all pairs and atomically replaces `invoice_pairs` | Detection is cheap (~1.3 s at 10k invoices) and pure; incremental pair maintenance would be complex and error-prone. Atomic replacement keeps the pair table always consistent with the invoice set. |
+| 2026-09-28 | Phase 3 web app: React 18.3.1 vendored as UMD production builds served by FastAPI (`webapp/`), no node/npm build pipeline | Charter D3 names an interactive React web app the primary deliverable, but the acceptance criterion requires the demo to run offline and AGENTS.md requires minimal dependencies. Vendoring the two MIT-licensed UMD files (unmodified, from unpkg `react@18.3.1`/`react-dom@18.3.1`) gives real React with zero new Python packages, no CDN calls, and no build step; the SPA is plain `React.createElement` code in `app.js`. Revisit (Vite build) only if the UI grows beyond a single file. |
+| 2026-09-28 | `seed-demo` command + nullable `invoices.duplicate_of`/`variant` columns | The dashboard's threshold slider needs a precision number that is honest at any position, which requires labeled pairs; persisting the synthetic ground truth makes the demo measurable (P/R at any threshold) instead of decorative. Columns are NULL for regular PDF ingestion, so production behavior is unchanged. Detection is re-run synchronously in the seed command (~1.3 s at 10k) — no worker round-trip needed. |
+| 2026-09-28 | `GET /metrics` returns the full scored distribution; the server also computes `at_threshold` | The slider must update live for arbitrary thresholds; shipping raw per-pair rows (score, GT flag, exposure, decision — ~4.5 kB/1k pairs) lets the client recompute instantly. The server-side `at_threshold` block (`metrics.threshold_metrics`) is the unit-tested source of truth, so UI and API cannot drift far. Precision is reported as *measured* (vs seeded GT) or *estimated* (review decisions only) and never conflated. |
+| 2026-09-28 | `GET /pairs` enriched with both invoices' fields + stored decision instead of client-side N+1 fetches | The review queue renders a comparison from one request; at 100+ queued pairs, per-invoice fetches would triple latency and complicate the UI for no benefit. |

@@ -136,3 +136,88 @@ def test_pair_ordering_and_labels(client):
     invoices = client.get("/invoices").json()
     assert len(invoices) == 1
     assert invoices[0]["source_type"] == "pdf"
+
+
+def test_pairs_enriched_with_invoices_and_decision(client):
+    """Review-queue payload: both invoices' fields, breakdown, and the decision."""
+    client.post("/invoices/pdf", files={"file": ("a.pdf", pdfgen.make_pdf(INVOICE_A), "application/pdf")})
+    client.post("/invoices/pdf", files={"file": ("b.pdf", pdfgen.make_pdf(INVOICE_B), "application/pdf")})
+    _drain_queue()
+
+    pairs = client.get("/pairs", params={"label": "flag"}).json()
+    assert pairs, "expected the duplicate to be flagged"
+    pair = pairs[0]
+    for side in ("a", "b"):
+        assert set(pair[side]) >= {
+            "id", "vendor_name", "invoice_no", "amount", "currency", "invoice_date",
+            "tax_id", "source_type", "source_name", "extraction_confidence",
+        }
+    assert pair["a"]["extraction_confidence"] == 1.0
+    assert set(pair["breakdown"]) >= {"invoice_no", "vendor", "amount", "date", "tax_id"}
+    assert pair["decision"] is None
+
+    id_a, id_b = pair["id_a"], pair["id_b"]
+    resp = client.post(f"/pairs/{id_a}/{id_b}/decision", json={"decision": "duplicate"})
+    assert resp.status_code == 200
+
+    refetched = client.get("/pairs", params={"label": "flag"}).json()[0]
+    assert refetched["decision"] == "duplicate"
+
+    undecided = client.get("/pairs", params={"label": "flag", "undecided": "true"}).json()
+    assert all(p["decision"] is None for p in undecided)
+    assert (id_a, id_b) not in {(p["id_a"], p["id_b"]) for p in undecided}
+
+
+def test_metrics_endpoint_with_ground_truth_and_decisions(client):
+    """Dashboard payload: totals, measured precision vs seeded GT, decisions."""
+    from invoice_dedupe.cli import main as cli_main
+
+    assert cli_main(["seed-demo", "--n", "300", "--dup-rate", "0.05", "--seed", "11", "--reset"]) == 0
+
+    m = client.get("/metrics").json()
+    # the generator adds duplicate copies and recurring vendors on top of --n
+    assert m["n_invoices"] >= 300
+    assert m["n_gt_pairs"] and m["n_gt_pairs"] > 0
+    assert m["label_counts"].get("flag", 0) > 0
+    assert m["distribution"], "distribution rows required for the slider"
+
+    at = m["at_threshold"]
+    assert at["flagged"] == m["label_counts"]["flag"]
+    assert at["value_at_risk"] > 0
+    gt = at["gt"]
+    assert gt is not None
+    assert gt["tp"] + gt["fp"] == at["flagged"]
+    assert 0 < gt["recall"] <= 1.0
+    assert at["decided"] == 0
+    assert at["estimated_precision"] is None
+
+    # reviewer confirms the top pair -> decision-based estimate becomes available
+    pair = client.get("/pairs", params={"label": "flag"}).json()[0]
+    resp = client.post(
+        f"/pairs/{pair['id_a']}/{pair['id_b']}/decision", json={"decision": "duplicate"}
+    )
+    assert resp.status_code == 200
+
+    m2 = client.get("/metrics").json()
+    assert m2["decisions"] == {"duplicate": 1}
+    at2 = m2["at_threshold"]
+    assert at2["decided"] == 1
+    assert at2["estimated_precision"] == 1.0
+
+    # threshold parameter changes the server-computed numbers
+    m3 = client.get("/metrics", params={"flag_threshold": 0.99}).json()
+    assert m3["at_threshold"]["flagged"] <= at["flagged"]
+
+    # seeding again without --reset is refused
+    assert cli_main(["seed-demo", "--n", "300", "--seed", "11"]) == 1
+
+
+def test_seed_demo_reset_replaces_data(client):
+    from invoice_dedupe.cli import main as cli_main
+
+    assert cli_main(["seed-demo", "--n", "100", "--dup-rate", "0.05", "--seed", "3", "--reset"]) == 0
+    first = client.get("/metrics").json()
+    assert cli_main(["seed-demo", "--n", "120", "--dup-rate", "0.05", "--seed", "4", "--reset"]) == 0
+    m = client.get("/metrics").json()
+    # reset replaced (not appended to) the previous dataset
+    assert m["n_invoices"] >= 120 and m["n_invoices"] != first["n_invoices"]

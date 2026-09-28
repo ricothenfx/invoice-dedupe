@@ -1,6 +1,6 @@
 # PROJECT_CHARTER — invoice-dedupe
 
-Status: **Phase 2 complete** (last updated 2026-09-28).
+Status: **Phase 3 complete** (last updated 2026-09-28).
 This charter is the binding agreement for the project's direction. Future work — by the
 owner or by AI agents — must conform to it and must not depend on prior chat history.
 
@@ -70,11 +70,11 @@ fields are stored separately so prompts can improve without invalidating audit t
 - [x] Acceptance: upload a text-layer PDF via API → duplicates detected and persisted;
       evaluation pipeline still reproducible via seed
 
-### Phase 3 — Interactive web app  *(this phase makes the project presentable)*
-- [ ] Upload UI + invoice list
-- [ ] Review queue showing pair comparisons with per-field score breakdown
-- [ ] Dashboard with threshold slider + live estimated precision + business metrics
-- [ ] Acceptance: a reviewer can triage 100 flagged pairs in minutes; demo runs offline
+### Phase 3 — Interactive web app  *(DONE, 2026-09-28 — this phase makes the project presentable)*
+- [x] Upload UI + invoice list
+- [x] Review queue showing pair comparisons with per-field score breakdown
+- [x] Dashboard with threshold slider + live estimated precision + business metrics
+- [x] Acceptance: a reviewer can triage 100 flagged pairs in minutes; demo runs offline
 
 ### Phase 4 — Wow factor + learning loop
 - [ ] Vision-LLM extraction fallback for scans/photos (validated JSON schema, mock mode)
@@ -95,6 +95,24 @@ fields are stored separately so prompts can improve without invalidating audit t
 
 ## 7. Current status log
 
+- **2026-09-28** — Phase 3 complete. Interactive web app served by the FastAPI
+  process (`GET /`): React 18.3.1 vendored as UMD builds (no build step, no CDN —
+  offline by construction; zero new Python dependencies, decision log updated).
+  Dashboard with threshold slider recomputing flagged count / precision / recall /
+  double-payment exposure live from the `/metrics` distribution, threshold curves,
+  score histogram; review queue with side-by-side comparisons, per-field breakdown
+  bars, tax-ID/rule chips, keyboard triage (`j/k/d/n`) with auto-advance; paginated
+  invoice list; PDF upload with job polling. Backend: `GET /metrics`,
+  enriched `GET /pairs` (both invoices + stored decision, `undecided` filter),
+  `seed-demo` CLI (synthetic dataset + ground truth into nullable
+  `invoices.duplicate_of`/`variant` columns, synchronous detection), `metrics.py`
+  (unit-tested threshold computation). Acceptance verified live at seed 42:
+  203 flagged / 483 review pairs triage-ready instantly; dashboard reproduces
+  P 0.9852 / R 1.0000 @ 0.90 and matches the CLI sweep at 0.95 (142 flagged,
+  P 1.0000, R 0.7100); decisions persist and feed the decision-based precision
+  estimate. UI verified rendered via headless Chrome (dashboard, queue, invoices).
+  Engine untouched; demo metrics unchanged (P 0.9852 / R 1.0000 / F1 0.9926);
+  53 tests green with DB (11 new), 43 passed / 10 skipped without.
 - **2026-09-28** — Phase 2 complete. FastAPI service (`api.py`), pdfplumber text-layer
   extraction with per-invoice confidence (`extraction.py`), PostgreSQL persistence
   (`db.py`: invoices / invoice_pairs / review_decisions / jobs), worker queue via

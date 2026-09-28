@@ -1,4 +1,4 @@
-"""invoice-dedupe CLI: generate, run, evaluate, demo, init-db, serve, worker, make-pdf."""
+"""invoice-dedupe CLI: generate, run, evaluate, demo, init-db, serve, worker, make-pdf, seed-demo."""
 from __future__ import annotations
 
 import argparse
@@ -106,6 +106,45 @@ def cmd_init_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_seed_demo(args: argparse.Namespace) -> int:
+    """Load a seeded synthetic dataset (with ground truth) and run detection.
+
+    Gives the Phase 3 web app a realistic review queue (hundreds of flagged
+    pairs) without hand-crafting PDFs. Ground truth is persisted in the
+    nullable `duplicate_of`/`variant` columns, so the dashboard can measure
+    precision/recall live at any threshold. Regular PDF ingestion is unaffected.
+    """
+    invoices, meta = generate_dataset(n_invoices=args.n, dup_rate=args.dup_rate, seed=args.seed)
+    with db.connect() as conn:
+        db.init_schema(conn)
+        existing = db.count_invoices(conn)
+        if existing and not args.reset:
+            print(
+                f"error   : database already holds {existing:,} invoices; "
+                "use --reset to replace all data"
+            )
+            return 1
+        if args.reset:
+            db.truncate_all(conn)
+        inserted = db.insert_invoices_bulk(
+            conn,
+            invoices,
+            source_type="synthetic",
+            source_name=f"seeded demo (n={args.n}, seed={args.seed})",
+        )
+        config = ScoringConfig()
+        result = detect(invoices, config)
+        db.replace_pairs(conn, result.pairs)
+
+    print(f"seeded  : {inserted:,} invoices, {meta['n_duplicates']} ground-truth duplicates")
+    print(
+        f"pairs   : {len(result.pairs):,} scored "
+        f"({result.stats.get('flagged', 0):,} flagged, {result.stats.get('review', 0):,} review)"
+    )
+    print("next    : invoice-dedupe serve   # then open http://127.0.0.1:8000")
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
@@ -171,6 +210,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p_init = sub.add_parser("init-db", help="create the PostgreSQL schema (idempotent)")
     p_init.set_defaults(func=cmd_init_db)
+
+    p_seed = sub.add_parser(
+        "seed-demo",
+        help="load a seeded synthetic dataset (with ground truth) into PostgreSQL for the web app",
+    )
+    p_seed.add_argument("--n", type=int, default=10_000)
+    p_seed.add_argument("--dup-rate", type=float, default=0.02)
+    p_seed.add_argument("--seed", type=int, default=42)
+    p_seed.add_argument("--reset", action="store_true", help="replace existing data")
+    p_seed.set_defaults(func=cmd_seed_demo)
 
     p_serve = sub.add_parser("serve", help="run the FastAPI service")
     p_serve.add_argument("--host", default="127.0.0.1")

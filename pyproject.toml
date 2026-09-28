@@ -28,6 +28,9 @@ invoice-dedupe = "invoice_dedupe.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+invoice_dedupe = ["webapp/*.html", "webapp/*.css", "webapp/*.js", "webapp/vendor/*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

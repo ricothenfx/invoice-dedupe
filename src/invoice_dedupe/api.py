@@ -6,8 +6,15 @@ Endpoints (Phase 2, charter §5):
   GET  /jobs/{job_id}                   job status/result
   GET  /invoices                        list invoices (parsed fields, no raw text)
   GET  /invoices/{invoice_id}           single invoice incl. raw extraction text
-  GET  /pairs?label=flag|review|pass    detection results
+  GET  /pairs?label=&undecided=         detection results, enriched for the
+                                        review queue (both invoices + decision)
   POST /pairs/{id_a}/{id_b}/decision    persist a reviewer decision (Phase 4 input)
+
+Endpoints (Phase 3, charter §5):
+  GET  /                                review-queue web app (React SPA)
+  GET  /static/...                      web app assets (vendored React, no CDN)
+  GET  /metrics?flag_threshold=         dashboard: counts, threshold-dependent
+                                        precision/exposure, score distribution
 
 Uploads are asynchronous: the API only validates and enqueues; workers do the
 extraction and detection (see worker.py).
@@ -16,17 +23,20 @@ from __future__ import annotations
 
 import base64
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 
 import psycopg
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import db
+from . import db, metrics
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
+WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
 
 
 @asynccontextmanager
@@ -39,7 +49,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="invoice-dedupe",
     description="Detect duplicate invoices to prevent double payments",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -116,11 +126,44 @@ def get_invoice(invoice_id: str) -> dict:
 @app.get("/pairs")
 def list_pairs(
     label: Literal["flag", "review", "pass"] | None = None,
+    undecided: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> list[dict]:
     with _conn() as conn:
-        return db.list_pairs(conn, label=label, limit=limit, offset=offset)
+        return db.list_pairs_detailed(
+            conn, label=label, undecided=undecided, limit=limit, offset=offset
+        )
+
+
+@app.get("/metrics")
+def get_metrics(
+    flag_threshold: float = Query(0.90, ge=0.0, le=1.0),
+) -> dict:
+    """Dashboard payload: totals plus everything the threshold slider needs.
+
+    `distribution` carries one row per scored pair (score, GT flag, exposure,
+    decision), so the UI can recompute live numbers for any slider position
+    client-side; `at_threshold` is the server-computed source of truth at the
+    requested threshold (covered by tests).
+    """
+    with _conn() as conn:
+        n_invoices = db.count_invoices(conn)
+        n_gt_pairs = db.count_gt_pairs(conn)
+        label_counts = db.label_counts(conn)
+        decisions = db.decision_counts(conn)
+        distribution = db.scored_distribution(conn)
+    return {
+        "n_invoices": n_invoices,
+        "n_gt_pairs": n_gt_pairs,
+        "label_counts": label_counts,
+        "decisions": decisions,
+        "flag_threshold": flag_threshold,
+        "at_threshold": metrics.threshold_metrics(
+            distribution, flag_threshold, n_gt_pairs
+        ),
+        "distribution": distribution,
+    }
 
 
 @app.post("/pairs/{id_a}/{id_b}/decision")
@@ -129,3 +172,20 @@ def decide_pair(id_a: str, id_b: str, body: DecisionInput) -> dict:
         if not db.pair_exists(conn, id_a, id_b):
             raise HTTPException(status_code=404, detail="pair not found")
         return db.upsert_review_decision(conn, id_a, id_b, body.decision, body.reviewer)
+
+
+# --- web app (Phase 3) --------------------------------------------------------
+# Served last so API routes keep precedence; assets are vendored (React UMD
+# production builds) so the demo runs fully offline, no CDN.
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return FileResponse(WEBAPP_DIR / "index.html")
+
+
+app.mount(
+    "/static",
+    StaticFiles(directory=WEBAPP_DIR),
+    name="static",
+)
