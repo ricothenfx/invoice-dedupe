@@ -24,6 +24,9 @@ blocking, and contextual rules — with a review queue for the gray zone.
 | Detection time | ~1.3 s, single process |
 | Duplicate value caught | **$7.36M** |
 
+Re-verified unchanged after Phase 2 (service/ingestion layer added; detection engine
+untouched).
+
 Recall per duplicate variant (all 100%): `format`, `confusion`, `vendor_variant`,
 `reinvoice` (vendor resubmits with a brand-new number — the hardest and most expensive
 class), `date_shift`.
@@ -32,8 +35,8 @@ class), `date_shift`.
 ≤14 days apart + different numbers, flagged by the re-invoice rule. That is healthy
 precision: such a pair genuinely deserves human scrutiny in the real world (monthly
 billing that happens to land close together vs. an actual resubmission). Planned
-mitigations: a `billing_period` field (Phase 2) and a feedback loop from review
-decisions (Phase 4).
+mitigations: suppressing recurring-billing collisions with the `billing_period` key and
+a feedback loop from review decisions (Phase 4; the API already persists decisions).
 
 ## How it works
 
@@ -87,6 +90,30 @@ invoice-dedupe evaluate --dataset datasets/invoices.jsonl --pairs datasets/pairs
 pytest
 ```
 
+### Service mode (Phase 2)
+
+```bash
+# 1. PostgreSQL (any instance works; default DSN below, override with DEDUPE_DATABASE_URL)
+docker run -d --name invoice-dedupe-postgres \
+  -e POSTGRES_USER=invoice_dedupe -e POSTGRES_PASSWORD=invoice_dedupe \
+  -e POSTGRES_DB=invoice_dedupe -p 127.0.0.1:5433:5432 postgres:16-alpine
+
+# 2. schema, API, worker
+invoice-dedupe init-db
+invoice-dedupe serve --port 8000        # terminal 1
+invoice-dedupe worker                   # terminal 2
+
+# 3. upload a text-layer PDF; the worker extracts + detects asynchronously
+invoice-dedupe make-pdf --out sample.pdf
+curl -F "file=@sample.pdf;type=application/pdf" http://127.0.0.1:8000/invoices/pdf
+curl http://127.0.0.1:8000/pairs?label=flag
+```
+
+API: `GET /health` · `POST /invoices/pdf` · `GET /jobs/{id}` · `GET /invoices` ·
+`GET /invoices/{id}` · `GET /pairs?label=flag|review|pass` ·
+`POST /pairs/{a}/{b}/decision`. Raw extraction text is stored per invoice
+(`GET /invoices/{id}`) separately from the parsed fields.
+
 ## Layout
 
 ```
@@ -98,7 +125,12 @@ src/invoice_dedupe/
   synth.py       synthetic dataset generator + 5 duplicate variant classes (ground truth)
   evaluate.py    precision/recall/F1, threshold sweep, per-variant recall
   dataset.py     JSONL I/O
-  cli.py         generate / run / evaluate / demo
+  cli.py         generate / run / evaluate / demo / init-db / serve / worker / make-pdf
+  extraction.py  pdfplumber text-layer extraction + label-based field parser
+  pdfgen.py      dependency-free text-layer PDF writer (demo/test fixtures)
+  db.py          PostgreSQL persistence (invoices, pairs, review decisions, jobs)
+  worker.py      job queue consumer (extraction + detection)
+  api.py         FastAPI service
 ```
 
 ## Roadmap
@@ -116,6 +148,9 @@ Acceptance criteria per phase: see [`docs/PROJECT_CHARTER.md`](docs/PROJECT_CHAR
   differences, credit notes).
 - Legitimate recurring invoices (monthly subscriptions) are deliberately planted in the
   dataset as *hard negatives*. Currently some land in the review queue rather than being
-  flagged; handling them fully requires `billing_period` (Phase 2) and the feedback loop
+  flagged; handling them fully requires the `billing_period` key and the feedback loop
   (Phase 4).
 - Thresholds (0.90/0.70) are hand-set for now; labeled review decisions will replace them.
+- PDF ingestion covers **text-layer** documents with labeled fields (pdfplumber);
+  unlabeled layouts and scans/photos need the Phase 4 vision-LLM fallback. Every
+  invoice reports its extraction confidence and missing fields.

@@ -5,17 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "invoice-dedupe"
 version = "0.1.0"
-description = "Deteksi invoice duplikat (double payment) melalui normalisasi, fuzzy matching berbobot, blocking, dan aturan kontekstual"
+description = "Duplicate invoice detection (double-payment prevention) via canonical normalization, weighted fuzzy matching, blocking, and contextual rules"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Rico" }]
 dependencies = [
     "rapidfuzz>=3.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pdfplumber>=0.11",
+    "psycopg[binary]>=3.1",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
 
 [project.scripts]
 invoice-dedupe = "invoice_dedupe.cli:main"

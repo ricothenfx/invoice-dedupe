@@ -1,6 +1,6 @@
 # PROJECT_CHARTER — invoice-dedupe
 
-Status: **Phase 1 complete** (last updated 2026-09-28).
+Status: **Phase 2 complete** (last updated 2026-09-28).
 This charter is the binding agreement for the project's direction. Future work — by the
 owner or by AI agents — must conform to it and must not depend on prior chat history.
 
@@ -40,7 +40,7 @@ queue.
 
 ```
 Phase 1 (DONE): pure-Python engine + synthetic data + CLI evaluation
-Phase 2:        FastAPI service + PDF ingestion (pdfplumber) + PostgreSQL + worker queue
+Phase 2 (DONE): FastAPI service + PDF ingestion (pdfplumber) + PostgreSQL + worker queue
 Phase 3:        React web app: review queue with per-field score breakdown + dashboard
 Phase 4:        vision-LLM extraction fallback + feedback loop (threshold/weight tuning)
 ```
@@ -62,12 +62,12 @@ fields are stored separately so prompts can improve without invalidating audit t
 - [x] Results: precision 0.9852, recall 1.0000, F1 0.9926 @ 10,200 invoices, 99.99%
       blocking reduction, ~1.3 s
 
-### Phase 2 — API + PDF ingestion
-- [ ] FastAPI service exposing upload + detection + pair results
-- [ ] PDF ingestion with pdfplumber (text layer); store raw extraction separately
-- [ ] PostgreSQL persistence (invoices, pairs, review decisions)
-- [ ] Worker queue for extraction/detection jobs
-- [ ] Acceptance: upload a text-layer PDF via API → duplicates detected and persisted;
+### Phase 2 — API + PDF ingestion (DONE, 2026-09-28)
+- [x] FastAPI service exposing upload + detection + pair results
+- [x] PDF ingestion with pdfplumber (text layer); store raw extraction separately
+- [x] PostgreSQL persistence (invoices, pairs, review decisions)
+- [x] Worker queue for extraction/detection jobs
+- [x] Acceptance: upload a text-layer PDF via API → duplicates detected and persisted;
       evaluation pipeline still reproducible via seed
 
 ### Phase 3 — Interactive web app  *(this phase makes the project presentable)*
@@ -95,6 +95,16 @@ fields are stored separately so prompts can improve without invalidating audit t
 
 ## 7. Current status log
 
+- **2026-09-28** — Phase 2 complete. FastAPI service (`api.py`), pdfplumber text-layer
+  extraction with per-invoice confidence (`extraction.py`), PostgreSQL persistence
+  (`db.py`: invoices / invoice_pairs / review_decisions / jobs), worker queue via
+  `FOR UPDATE SKIP LOCKED` (`worker.py`); new CLI commands `init-db`, `serve`, `worker`,
+  `make-pdf`. Acceptance verified live: two text-layer PDFs uploaded over HTTP →
+  extraction + chained detection jobs done → duplicate pair persisted (score 1.0, label
+  `flag`); 42 tests green (15 new); demo re-run at seed 42 reproduces P 0.9852 /
+  R 1.0000 / F1 0.9926 unchanged (engine untouched). New runtime deps justified in the
+  DESIGN.md decision log. Environment note: `python3-venv` was unavailable, so the venv
+  was bootstrapped with `--without-pip` + get-pip.py (no project code impact).
 - **2026-09-28** — Phase 1 complete. Internationalized (English docs/CLI/data), decision
   log established, 27 tests green. Metrics reproduced at seed 42: P 0.9852 / R 1.0000 /
   F1 0.9926; $7.36M duplicate value caught; 3 FP all of the "same vendor+amount ≤14d"

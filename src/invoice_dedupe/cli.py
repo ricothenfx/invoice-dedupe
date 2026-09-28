@@ -1,4 +1,4 @@
-"""invoice-dedupe CLI: generate, run, evaluate, demo."""
+"""invoice-dedupe CLI: generate, run, evaluate, demo, init-db, serve, worker, make-pdf."""
 from __future__ import annotations
 
 import argparse
@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import db, pdfgen
 from .dataset import load_invoices, load_pairs, save_invoices, save_pairs
 from .engine import detect
 from .evaluate import evaluate, render_report, render_sweep, sweep_thresholds
@@ -98,6 +99,43 @@ def cmd_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init_db(args: argparse.Namespace) -> int:
+    with db.connect() as conn:
+        db.init_schema(conn)
+    print(f"database: schema initialized ({db.database_url()})")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    uvicorn.run("invoice_dedupe.api:app", host=args.host, port=args.port)
+    return 0
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    from . import worker as worker_mod
+
+    with db.connect() as conn:
+        worker_mod.run_worker(conn, poll_seconds=args.poll_seconds)
+    return 0
+
+
+def cmd_make_pdf(args: argparse.Namespace) -> int:
+    lines = [
+        f"Vendor: {args.vendor}",
+        f"Invoice No: {args.invoice_no}",
+        f"Invoice Date: {args.invoice_date}",
+        f"Amount Due: USD {args.amount}",
+        f"Tax ID: {args.tax_id}",
+    ]
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(pdfgen.make_pdf(lines))
+    print(f"pdf     : {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="invoice-dedupe",
@@ -130,6 +168,27 @@ def main(argv: list[str] | None = None) -> int:
     p_demo.add_argument("--seed", type=int, default=42)
     _add_scoring_args(p_demo)
     p_demo.set_defaults(func=cmd_demo)
+
+    p_init = sub.add_parser("init-db", help="create the PostgreSQL schema (idempotent)")
+    p_init.set_defaults(func=cmd_init_db)
+
+    p_serve = sub.add_parser("serve", help="run the FastAPI service")
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.set_defaults(func=cmd_serve)
+
+    p_worker = sub.add_parser("worker", help="run the job worker (extraction/detection)")
+    p_worker.add_argument("--poll-seconds", type=float, default=1.0)
+    p_worker.set_defaults(func=cmd_worker)
+
+    p_pdf = sub.add_parser("make-pdf", help="write a sample text-layer invoice PDF")
+    p_pdf.add_argument("--out", default="sample_invoice.pdf")
+    p_pdf.add_argument("--vendor", default="Northwind Logistics, Ltd.")
+    p_pdf.add_argument("--invoice-no", default="INV-2026-0001")
+    p_pdf.add_argument("--invoice-date", default="2026-09-14")
+    p_pdf.add_argument("--amount", default="12,500.00")
+    p_pdf.add_argument("--tax-id", default="12-3456789")
+    p_pdf.set_defaults(func=cmd_make_pdf)
 
     args = parser.parse_args(argv)
     return args.func(args)

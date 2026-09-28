@@ -27,8 +27,9 @@ the project documents below, never on prior chat history.**
 - **Phase discipline**: phases and their acceptance criteria live in the charter
   (§Roadmap). Finish a phase's criteria before starting the next. The current phase
   status is recorded at the bottom of the charter.
-- **Dependencies**: runtime dependencies stay minimal (currently `rapidfuzz` only).
-  Adding one requires a decision-log entry with justification.
+- **Dependencies**: runtime dependencies stay minimal (`rapidfuzz` for the engine; Phase 2
+  added `fastapi`, `uvicorn`, `pdfplumber`, `psycopg`, `python-multipart` for the service
+  layer). Adding one requires a decision-log entry with justification.
 - **Honesty over hype**: report precision/recall including false positives and describe
   known limitations. Planted *hard negatives* (recurring invoices) stay in the dataset.
 
@@ -41,14 +42,24 @@ invoice-dedupe demo --n 10000 --seed 42                      # e2e: generate+det
 invoice-dedupe generate --n 10000 --seed 42 --out datasets   # write dataset + meta.json
 invoice-dedupe run --dataset datasets/invoices.jsonl --out datasets/pairs.jsonl
 invoice-dedupe evaluate --dataset datasets/invoices.jsonl --pairs datasets/pairs.jsonl
+invoice-dedupe init-db                                       # create PostgreSQL schema
+invoice-dedupe serve                                         # run the FastAPI service
+invoice-dedupe worker                                        # run the job worker
+invoice-dedupe make-pdf --out sample.pdf                     # sample text-layer invoice PDF
 ```
+
+Database connection: `DEDUPE_DATABASE_URL` (default
+`postgresql://invoice_dedupe:invoice_dedupe@127.0.0.1:5433/invoice_dedupe`).
+Integration tests need `DEDUPE_TEST_DATABASE_URL` pointing at a disposable database and
+are skipped when it is unset.
 
 ## Layout
 
 ```
 src/invoice_dedupe/   engine package (normalize, scoring, blocking, engine, synth,
-                      evaluate, dataset, cli, models)
-tests/                pytest suite (27 tests)
+                      evaluate, dataset, cli, models) + service layer (extraction,
+                      pdfgen, db, worker, api)
+tests/                pytest suite (integration tests need DEDUPE_TEST_DATABASE_URL)
 docs/                 PROJECT_CHARTER.md, DESIGN.md
 datasets/             generated artifacts (git-ignored)
 ```

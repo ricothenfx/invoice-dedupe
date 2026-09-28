@@ -113,7 +113,70 @@ per variant class, and review-queue load. Current reference run (seed 42, 10,200
 invoices): **P 0.9852 / R 1.0000 / F1 0.9926**, 3 FP (all same-vendor+amount ≤14d
 re-invoice-pattern pairs — genuinely ambiguous without `billing_period`).
 
-## 6. Data model (Phase 1, in-memory + JSONL)
+## 6. PDF ingestion (Phase 2)
+
+The deterministic, primary extraction path of decision D6: PDFs with a text layer are
+parsed locally with **pdfplumber**. The vision-LLM fallback for scans/photos is Phase 4
+and must not leak into this path.
+
+```
+PDF bytes
+   │  extraction.extract_pdf()
+   ▼
+raw text ──────────────────────────► stored verbatim (audit trail, invoices.raw_text)
+   │  parse_fields()                  label-based, conservative
+   ▼
+fields (vendor, number, amount, date, tax id)
+   │  result_to_invoice()             missing fields stay empty, never guessed
+   ▼
+Invoice → normalization → detection (unchanged Phase 1 engine)
+```
+
+Parser rules:
+- Field lines must carry an explicit label (`Vendor:`, `Invoice No:`, `Invoice Date:`,
+  `Amount Due:`/`Total:`, `Tax ID:`/`VAT:`); unstructured text is ignored.
+- `Invoice No` and `Invoice Date` labels are disambiguated, and amounts reuse the
+  Phase 1 international/European amount parser.
+- Dates accept ISO, `14 Sep 2026`, `September 14, 2026`, and `14/09/2026` forms.
+- **Extraction confidence** = fraction of the 4 core fields found (vendor, number,
+  amount, date). It is persisted per invoice and reported by the API; missing fields
+  are listed explicitly. Known limitation (honest, by design): the label parser covers
+  structured invoice documents; arbitrary layouts need the Phase 4 fallback.
+
+## 7. Service architecture (Phase 2)
+
+```
+┌─────────┐  POST /invoices/pdf   ┌──────────┐  jobs table   ┌────────┐
+│ client  │ ────────────────────► │ FastAPI  │ ────────────► │ worker │
+└─────────┘                       │  (api)   │               │(worker)│
+                                  └────┬─────┘               └───┬────┘
+                                       │        PostgreSQL       │ pdfplumber
+                                       │  ┌──────────────────┐   │ engine.detect
+                                       └─►│ invoices         │◄──┘
+                                          │ invoice_pairs    │
+                                          │ review_decisions │
+                                          │ jobs (queue)     │
+                                          └──────────────────┘
+```
+
+- **API** (`api.py`): `GET /health`, `POST /invoices/pdf` (multipart, validated
+  `%PDF-` magic, ≤10 MiB, returns `202` + job id), `GET /jobs/{id}`, `GET /invoices`,
+  `GET /invoices/{id}` (includes raw extraction text), `GET /pairs?label=`, and
+  `POST /pairs/{a}/{b}/decision` (persists reviewer verdicts for the Phase 4 loop).
+  Uploads are asynchronous by design: the API only validates and enqueues.
+- **Worker** (`worker.py`): claims jobs from the `jobs` table with
+  `SELECT … FOR UPDATE SKIP LOCKED` (safe with multiple workers), runs
+  `extract_pdf` (extract → insert invoice with raw text → enqueue `detect`) and
+  `detect` (re-run `engine.detect` over all invoices → atomically replace
+  `invoice_pairs`). Failures mark the job `failed` with the error text; bad input
+  never kills the worker.
+- **Persistence** (`db.py`): plain SQL via psycopg 3. Raw extraction text lives in
+  `invoices.raw_text`, separate from the parsed columns, so extraction can improve
+  without invalidating audit trails (charter §4).
+
+## 8. Data model
+
+Phase 1 (in-memory + JSONL):
 
 ```
 Invoice          id, vendor_name, invoice_no, amount, currency, invoice_date,
@@ -122,11 +185,14 @@ NormalizedInvoice id, vendor, vendor_key, invoice_no, amount, date, tax_id, bill
 PairResult       id_a, id_b, score, label, breakdown (per-field similarities + rules)
 ```
 
-Phase 2 will persist these in PostgreSQL (`invoices`, `invoice_pairs`, `review_decisions`
-— the last one feeding the Phase 4 feedback loop) and store raw extraction separately
-from normalized fields.
+Phase 2 (PostgreSQL): `invoices` (parsed columns + `raw_text`,
+`extraction_method`, `extraction_confidence`), `invoice_pairs`
+(`score`, `label`, `breakdown` JSONB), `review_decisions` (`duplicate` /
+`not_duplicate`, feeds Phase 4), `jobs` (`extract_pdf` / `detect`, statuses
+`pending → running → done|failed`). `review_decisions` currently records
+verdicts; acting on them (threshold tuning) is Phase 4.
 
-## 7. Decision log
+## 9. Decision log
 
 | Date | Decision | Rationale |
 |---|---|---|
@@ -139,3 +205,9 @@ from normalized fields.
 | 2026-09-28 | Synthetic amounts keep fine granularity (≥4,000 distinct values per category) | Coarse USD steps (180 distinct values) caused massive amount-block collisions: precision fell to 0.83. Restored to 0.985. |
 | 2026-09-28 | Internationalized everything (English docs/CLI/data, USD, multi-jurisdiction legal forms) | Product targets a global audience (charter D5). |
 | 2026-09-28 | Pair similarity rounding to 9 decimals | Floating-point noise made identical pairs score 0.9999…9 breaking exact-match tests. |
+| 2026-09-28 | Phase 2 runtime deps: `fastapi` + `uvicorn` (API), `pdfplumber` (text-layer extraction), `psycopg[binary]` (PostgreSQL driver), `python-multipart` (FastAPI file uploads); dev-only `httpx` (TestClient) | Each is required by charter §5 Phase 2 scope (FastAPI service, pdfplumber ingestion, PostgreSQL). No ORM, no broker, no cloud SDKs; everything else reuses the stdlib. |
+| 2026-09-28 | PostgreSQL `jobs` table as the worker queue (`FOR UPDATE SKIP LOCKED`), not Celery/Redis | One fewer service to run; transactional claim gives exactly-once processing with multiple workers; queue depth is visible in SQL. PDF payloads are base64 in the job row (uploads capped at 10 MiB), so no shared filesystem is needed. |
+| 2026-09-28 | Raw SQL via psycopg 3 instead of an ORM (SQLAlchemy) | Four small tables; schema is a single auditable DDL string in `db.py`. An ORM would add a heavy dependency with no benefit at this scale. |
+| 2026-09-28 | Dependency-free minimal PDF writer (`pdfgen.py`) instead of a PDF-generation library | Demos and tests need text-layer fixture PDFs; a 60-line writer avoids a dev/runtime dependency and is verified round-trip through pdfplumber. |
+| 2026-09-28 | Conservative label-based field parser with per-invoice extraction confidence | Guessing fields would corrupt the matching engine's input and the audit trail. Missing fields are reported (`missing` list + confidence), and the vision-LLM fallback for layouts without labels is explicitly Phase 4 (charter D6). |
+| 2026-09-28 | `detect` job recomputes all pairs and atomically replaces `invoice_pairs` | Detection is cheap (~1.3 s at 10k invoices) and pure; incremental pair maintenance would be complex and error-prone. Atomic replacement keeps the pair table always consistent with the invoice set. |
