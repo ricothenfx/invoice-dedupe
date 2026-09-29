@@ -202,6 +202,8 @@ The web app (served at `/`, fully offline — assets vendored, no CDN):
   take minutes.
 - **Invoices** — paginated list with extraction confidence and duplicate-variant
   badges. **Upload** — drag & drop PDFs with live job progress.
+- **Light/dark theme** — toggle in the header; the choice is remembered in the
+  browser and falls back to your OS preference (dark by default).
 
 API: `GET /` (web app) · `GET /health` · `POST /invoices/pdf` ·
 `POST /invoices/photo` (PNG/JPEG → vision-LLM extraction) · `GET /jobs/{id}` ·

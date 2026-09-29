@@ -13,6 +13,9 @@
   const h = React.createElement;
   const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
+  // Theme persistence key — must match the inline bootstrap in index.html.
+  const THEME_KEY = "dedupe-theme";
+
   // Display-only copy of scoring.FieldWeights (engine constants, DESIGN §3).
   const WEIGHTS = { invoice_no: 0.35, vendor: 0.25, amount: 0.3, date: 0.1 };
 
@@ -264,7 +267,7 @@
           h("span", null, "0.00"), h("span", null, "0.50"), h("span", null, "1.00")),
         h("div", { className: "legend" },
           h("span", null, h("i", { className: "swatch", style: { background: "var(--red)" } }), "true duplicates (seeded GT)"),
-          h("span", null, h("i", { className: "swatch", style: { background: "#37506b" } }), "other candidate pairs"))));
+          h("span", null, h("i", { className: "swatch", style: { background: "var(--hist-nongt)" } }), "other candidate pairs"))));
   }
 
   // ------------------------------------------------------------- review queue
@@ -562,6 +565,16 @@
       history.replaceState(null, "", "#" + id);
     }, []);
     const [dbStatus, setDbStatus] = useState(null);
+    // Theme is applied to <html data-theme> by the inline bootstrap; React only mirrors it.
+    const [theme, setTheme] = useState(() => document.documentElement.dataset.theme === "light" ? "light" : "dark");
+    const toggleTheme = useCallback(() => {
+      setTheme((t) => {
+        const next = t === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* storage unavailable */ }
+        return next;
+      });
+    }, []);
 
     useEffect(() => {
       const onNav = (e) => setTab(e.detail);
@@ -595,7 +608,13 @@
         h("div", { className: "status" },
           dbStatus == null ? "checking database…" :
             dbStatus ? h("span", { className: "ok" }, "● database connected") :
-              h("span", { className: "down" }, "● database unavailable"))),
+              h("span", { className: "down" }, "● database unavailable")),
+        h("button", {
+          className: "theme-toggle",
+          onClick: toggleTheme,
+          title: "Switch between dark and light theme",
+          "aria-label": "Switch theme",
+        }, theme === "dark" ? "Light mode" : "Dark mode")),
       h("main", null, view));
   }
 

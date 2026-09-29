@@ -35,3 +35,14 @@ def test_static_assets_served():
         resp = client.get(path)
         assert resp.status_code == 200, path
         assert marker in resp.text, path
+
+
+def test_theme_support():
+    # index.html must bootstrap the theme before first paint (no flash)
+    resp = client.get("/")
+    assert "data-theme" in resp.text
+    assert "localStorage" in resp.text
+    # both palettes must exist in the stylesheet
+    css = client.get("/static/styles.css")
+    assert css.status_code == 200
+    assert ":root[data-theme=\"light\"]" in css.text

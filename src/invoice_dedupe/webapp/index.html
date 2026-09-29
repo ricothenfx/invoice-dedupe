@@ -4,13 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>invoice-dedupe — duplicate review</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1">
+  <script>
+    /* Set the theme (data-theme attribute) before first paint: stored choice
+       wins, else OS preference, else dark. */
+    (function () {
+      var stored = null;
+      try { stored = localStorage.getItem("dedupe-theme"); } catch (e) { /* storage unavailable */ }
+      var theme = stored === "light" || stored === "dark" ? stored
+        : (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/styles.css?v=2">
 </head>
 <body>
   <div id="root"></div>
   <noscript>This review app requires JavaScript.</noscript>
   <script src="/static/vendor/react.production.min.js?v=18.3.1"></script>
   <script src="/static/vendor/react-dom.production.min.js?v=18.3.1"></script>
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>
