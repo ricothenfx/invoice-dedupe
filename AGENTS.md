@@ -29,8 +29,10 @@ the project documents below, never on prior chat history.**
   status is recorded at the bottom of the charter.
 - **Dependencies**: runtime dependencies stay minimal (`rapidfuzz` for the engine; Phase 2
   added `fastapi`, `uvicorn`, `pdfplumber`, `psycopg`, `python-multipart` for the service
-  layer; Phase 3 added **none** — the web app vendors React UMD assets, see the decision
-  log). Adding one requires a decision-log entry with justification.
+  layer; Phase 3 added **none** — the web app vendors React UMD assets; Phase 4 added
+  **none** — the vision-LLM client uses stdlib `urllib` and fixture photos are written
+  with stdlib `zlib`, see the decision log). Adding one requires a decision-log entry
+  with justification.
 - **Honesty over hype**: report precision/recall including false positives and describe
   known limitations. Planted *hard negatives* (recurring invoices) stay in the dataset.
 
@@ -48,6 +50,9 @@ invoice-dedupe seed-demo                                     # load synthetic de
 invoice-dedupe serve                                         # run the FastAPI service (+ web app at /)
 invoice-dedupe worker                                        # run the job worker
 invoice-dedupe make-pdf --out sample.pdf                     # sample text-layer invoice PDF
+invoice-dedupe make-photo --out photo.png                    # crumpled-invoice photo PNG (vision fixture)
+invoice-dedupe simulate-feedback                             # persist GT reviewer decisions (demo input)
+invoice-dedupe tune                                          # fit thresholds/weights from decisions (+ --reset)
 ```
 
 Database connection: `DEDUPE_DATABASE_URL` (default

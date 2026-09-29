@@ -36,6 +36,8 @@ from . import db, metrics
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 PDF_MAGIC = b"%PDF-"
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
 WEBAPP_DIR = Path(__file__).resolve().parent / "webapp"
 
 
@@ -95,6 +97,31 @@ async def upload_pdf(
     return {"job_id": job_id, "status": "pending"}
 
 
+@app.post("/invoices/photo", status_code=202)
+async def upload_photo(
+    file: UploadFile = File(...),
+) -> dict:
+    """Upload a scan/photo of an invoice (PNG or JPEG) for vision-LLM extraction.
+
+    The vision layer runs in mock mode unless a real endpoint is configured
+    via ``DEDUPE_VISION_LLM_URL`` (charter decision D6). Asynchronous like
+    the PDF path: the API validates and enqueues, the worker extracts.
+    """
+    data = await file.read()
+    content_type = file.content_type or ""
+    if content_type not in ("image/png", "image/jpeg") or (
+        not data.startswith(PNG_MAGIC) and not data.startswith(JPEG_MAGIC)
+    ):
+        raise HTTPException(status_code=400, detail="not a PNG or JPEG image")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="image exceeds the 10 MiB upload limit")
+
+    payload = {"data": base64.b64encode(data).decode("ascii"), "name": file.filename or ""}
+    with _conn() as conn:
+        job_id = db.create_job(conn, "extract_image", payload)
+    return {"job_id": job_id, "status": "pending"}
+
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     with _conn() as conn:
@@ -138,14 +165,16 @@ def list_pairs(
 
 @app.get("/metrics")
 def get_metrics(
-    flag_threshold: float = Query(0.90, ge=0.0, le=1.0),
+    flag_threshold: float | None = Query(None, ge=0.0, le=1.0),
 ) -> dict:
     """Dashboard payload: totals plus everything the threshold slider needs.
 
-    `distribution` carries one row per scored pair (score, GT flag, exposure,
+    ``distribution`` carries one row per scored pair (score, GT flag, exposure,
     decision), so the UI can recompute live numbers for any slider position
-    client-side; `at_threshold` is the server-computed source of truth at the
-    requested threshold (covered by tests).
+    client-side; ``at_threshold`` is the server-computed source of truth at the
+    requested threshold (covered by tests). When a tuned model is active, pair
+    scores live in the tuned model's scale, so an omitted threshold defaults to
+    the tuned flag threshold; without tuning it defaults to 0.90.
     """
     with _conn() as conn:
         n_invoices = db.count_invoices(conn)
@@ -153,11 +182,24 @@ def get_metrics(
         label_counts = db.label_counts(conn)
         decisions = db.decision_counts(conn)
         distribution = db.scored_distribution(conn)
+        active_tuning = db.get_active_tuning(conn)
+    tuning_info = None
+    if active_tuning is not None:
+        tuning_info = {
+            "model_id": active_tuning["id"],
+            "flag_threshold": active_tuning["flag_threshold"],
+            "review_threshold": active_tuning["review_threshold"],
+            "n_decisions": active_tuning["n_decisions"],
+            "created_at": active_tuning["created_at"].isoformat(),
+        }
+    if flag_threshold is None:
+        flag_threshold = tuning_info["flag_threshold"] if tuning_info else 0.90
     return {
         "n_invoices": n_invoices,
         "n_gt_pairs": n_gt_pairs,
         "label_counts": label_counts,
         "decisions": decisions,
+        "tuning": tuning_info,
         "flag_threshold": flag_threshold,
         "at_threshold": metrics.threshold_metrics(
             distribution, flag_threshold, n_gt_pairs

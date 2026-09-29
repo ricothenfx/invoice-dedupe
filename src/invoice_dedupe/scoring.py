@@ -91,6 +91,9 @@ def score_pair(a: NormalizedInvoice, b: NormalizedInvoice, cfg: ScoringConfig) -
         "vendor": similarity_vendor(a.vendor, b.vendor),
         "amount": similarity_amount(a.amount, b.amount),
         "date": similarity_date(a.date, b.date, cfg.date_decay_days),
+        # stored for the Phase 4 feedback loop (feature, not score component):
+        # recurring false positives and re-invoice duplicates separate on it
+        "billing_period_match": 1.0 if (a.billing_period and a.billing_period == b.billing_period) else 0.0,
     }
     score = (
         cfg.weights.invoice_no * breakdown["invoice_no"]

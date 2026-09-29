@@ -7,12 +7,13 @@ e.g.::
 """
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
 from fastapi.testclient import TestClient
 
-from invoice_dedupe import db, pdfgen
+from invoice_dedupe import db, pdfgen, photogen
 from invoice_dedupe import worker as worker_mod
 from invoice_dedupe.api import app
 
@@ -45,7 +46,7 @@ def client(monkeypatch):
     with db.connect(TEST_URL) as conn:
         db.init_schema(conn)
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE invoices, invoice_pairs, review_decisions, jobs CASCADE")
+            cur.execute("TRUNCATE invoices, invoice_pairs, review_decisions, jobs, tuning CASCADE")
         conn.commit()
     with TestClient(app) as test_client:
         yield test_client
@@ -221,3 +222,127 @@ def test_seed_demo_reset_replaces_data(client):
     m = client.get("/metrics").json()
     # reset replaced (not appended to) the previous dataset
     assert m["n_invoices"] >= 120 and m["n_invoices"] != first["n_invoices"]
+
+
+# --- Phase 4: vision-LLM extraction fallback + feedback loop ------------------
+
+
+def test_upload_rejects_non_image(client):
+    resp = client.post("/invoices/photo", files={"file": ("x.png", b"hello", "image/png")})
+    assert resp.status_code == 400
+    resp = client.post("/invoices/photo", files={"file": ("x.bmp", b"BM...", "image/bmp")})
+    assert resp.status_code == 400
+
+
+def test_upload_photo_yields_fields_and_duplicate_verdict(client):
+    """Acceptance criterion: a phone photo of an invoice yields structured
+    fields and a duplicate verdict (mock vision, fully offline)."""
+    photo_a = photogen.make_photo(
+        vendor="Northwind Logistics, Ltd.",
+        invoice_no="INV-2026-0001",
+        invoice_date="2026-09-14",
+        amount="12,500.00",
+        tax_id="12-3456789",
+        seed=3,
+    )
+    # same transaction photographed crumpled: reformatted number + spelling
+    photo_b = photogen.make_photo(
+        vendor="NORTHWIND LOGISTICS LTD",
+        invoice_no="INV/2026/0001",
+        invoice_date="2026-09-14",
+        amount="12,500.00",
+        tax_id="12-3456789",
+        seed=9,
+    )
+    r_a = client.post("/invoices/photo", files={"file": ("a.png", photo_a, "image/png")})
+    r_b = client.post("/invoices/photo", files={"file": ("b.png", photo_b, "image/png")})
+    assert r_a.status_code == r_b.status_code == 202
+    job_a, job_b = r_a.json()["job_id"], r_b.json()["job_id"]
+
+    _drain_queue()
+
+    for job_id in (job_a, job_b):
+        job = client.get(f"/jobs/{job_id}").json()
+        assert job["status"] == "done", job
+        assert job["result"]["extraction_method"] == "vision_llm_mock"
+
+    invoices = client.get("/invoices").json()
+    assert {inv["extraction_method"] for inv in invoices} == {"vision_llm_mock"}
+    assert {inv["source_type"] for inv in invoices} == {"image"}
+    numbers = {inv["invoice_no"] for inv in invoices}
+    assert numbers == {"INV-2026-0001", "INV/2026/0001"}
+    assert all(inv["extraction_confidence"] is not None for inv in invoices)
+
+    # raw model output stored separately from the parsed fields (audit trail)
+    detail = client.get(f"/invoices/{invoices[0]['id']}").json()
+    raw = json.loads(detail["raw_text"])
+    assert set(raw) == {
+        "vendor_name", "invoice_no", "invoice_date", "amount",
+        "tax_id", "extraction_confidence",
+    }
+
+    flagged = client.get("/pairs", params={"label": "flag"}).json()
+    assert flagged, "expected the photographed duplicate to be flagged"
+    assert all(p["score"] >= 0.90 for p in flagged)
+
+
+def test_textless_pdf_falls_back_to_vision_and_reports_missing(client):
+    """D6 layering: a PDF without a text layer routes to the vision fallback;
+    when nothing is readable the fields are reported missing, never guessed."""
+    empty_pdf = pdfgen.make_pdf([])
+    resp = client.post("/invoices/pdf", files={"file": ("scan.pdf", empty_pdf, "application/pdf")})
+    assert resp.status_code == 202
+    job_id = resp.json()["job_id"]
+    _drain_queue()
+
+    job = client.get(f"/jobs/{job_id}").json()
+    assert job["status"] == "done", job
+    assert job["result"]["extraction_method"] == "vision_llm_mock"
+    assert job["result"]["confidence"] == 0.0
+    assert set(job["result"]["missing"]) == {"vendor_name", "invoice_no", "invoice_date", "amount"}
+
+    invoice = client.get("/invoices").json()[0]
+    assert invoice["extraction_method"] == "vision_llm_mock"
+    assert invoice["invoice_no"] == ""
+
+
+def test_simulate_feedback_and_tune_improves_review_queue(client):
+    """Acceptance criterion: thresholds improve measurably after simulated
+    feedback — the review queue shrinks at equal precision/recall."""
+    from invoice_dedupe.cli import main as cli_main
+
+    assert cli_main(
+        ["seed-demo", "--n", "2000", "--dup-rate", "0.05", "--seed", "5", "--reset"]
+    ) == 0
+    before = client.get("/metrics").json()
+    assert before["tuning"] is None
+    assert before["label_counts"].get("review", 0) > 0
+
+    assert cli_main(["simulate-feedback"]) == 0
+    assert cli_main(["tune", "--no-apply"]) == 0  # dry run changes nothing
+    assert client.get("/metrics").json()["tuning"] is None
+
+    assert cli_main(["tune"]) == 0
+
+    after = client.get("/metrics").json()
+    tuning_info = after["tuning"]
+    assert tuning_info is not None
+    assert tuning_info["n_decisions"] > 0
+    assert 0 < tuning_info["flag_threshold"] <= 1.0
+    assert after["label_counts"].get("review", 0) < before["label_counts"].get("review", 0)
+    # detection quality does not degrade
+    at_b, at_a = before["at_threshold"], after["at_threshold"]
+    assert at_a["gt"]["precision"] >= at_b["gt"]["precision"] - 0.001
+    assert at_a["gt"]["recall"] >= at_b["gt"]["recall"]
+
+    # a fresh detect job keeps applying the active tuning
+    with db.connect(TEST_URL) as conn:
+        result = worker_mod.handle_detect(conn, {})
+    assert result["tuned"] == tuning_info["model_id"]
+
+    # reset reverts to the base model
+    assert cli_main(["tune", "--reset"]) == 0
+    reset = client.get("/metrics").json()
+    assert reset["tuning"] is None
+    assert reset["label_counts"]["flag"] == before["label_counts"]["flag"]
+    assert reset["label_counts"].get("review", 0) == before["label_counts"].get("review", 0)

@@ -155,7 +155,10 @@
     const [threshold, setThreshold] = useState(0.9);
 
     useEffect(() => {
-      getJSON("/metrics?flag_threshold=0.90").then(setData).catch((e) => setError(e.message));
+      getJSON("/metrics").then((d) => {
+        setData(d);
+        if (d.tuning) setThreshold(Math.min(1, Math.max(0.5, d.tuning.flag_threshold)));
+      }).catch((e) => setError(e.message));
     }, []);
 
     const live = useMemo(() => (data ? computeLive(data, threshold) : null), [data, threshold]);
@@ -184,10 +187,10 @@
 
     const cards = [
       { label: "Invoices", value: (data.n_invoices || 0).toLocaleString("en-US") },
-      { label: "Flagged @ 0.90", value: (labels.flag || 0).toLocaleString("en-US"), sub: "auto-flagged duplicates" },
+      { label: data.tuning ? "Flagged (tuned)" : "Flagged @ 0.90", value: (labels.flag || 0).toLocaleString("en-US"), sub: "auto-flagged duplicates" },
       { label: "Review queue", value: (labels.review || 0).toLocaleString("en-US"), sub: "needs human triage" },
       { label: "Decisions", value: decidedTotal.toLocaleString("en-US"), sub: (decisions.duplicate || 0) + " confirmed duplicates" },
-      { label: "Value at risk @ 0.90", value: fmtMoney(live ? live.valueAtRisk * (threshold === 0.9 ? 1 : 1) : 0), sub: "double-payment exposure" },
+      { label: "Value at risk @ " + threshold.toFixed(2), value: fmtMoney(live ? live.valueAtRisk : 0), sub: "double-payment exposure" },
     ];
 
     const precisionSeries = data.n_gt_pairs
@@ -207,6 +210,12 @@
 
       h("div", { className: "panel" },
         h("h2", { style: { marginTop: 0 } }, "Flag threshold"),
+        data.tuning ? h("div", { className: "precision-note", style: { marginBottom: "10px" } },
+          h("strong", null, "Tuned model active (" + data.tuning.model_id + ")"),
+          " — learned from " + data.tuning.n_decisions + " review decisions; flag ≥ " +
+          data.tuning.flag_threshold + ", review ≥ " + data.tuning.review_threshold +
+          " (pair scores are the tuned model's). Run invoice-dedupe tune --reset to revert.")
+        : null,
         h("div", { className: "slider-row" },
           h("input", {
             type: "range", min: "0.5", max: "1", step: "0.005", value: threshold,

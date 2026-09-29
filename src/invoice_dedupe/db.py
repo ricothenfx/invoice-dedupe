@@ -1,8 +1,9 @@
 """PostgreSQL persistence: connections, schema, and query helpers.
 
-Tables (Phase 2, charter §5): ``invoices`` (with raw extraction stored
-separately from the parsed fields), ``invoice_pairs``, ``review_decisions``
-(feeds the Phase 4 feedback loop) and ``jobs`` (the worker queue).
+Tables: ``invoices`` (with raw extraction stored separately from the parsed
+fields), ``invoice_pairs``, ``review_decisions`` (feeds the Phase 4 feedback
+loop), ``jobs`` (the worker queue) and ``tuning`` (active tuned model with
+learned weights and thresholds, Phase 4).
 
 The schema is intentionally managed with plain SQL instead of an ORM: the
 data model is small and auditable, and it keeps runtime dependencies minimal.
@@ -60,7 +61,7 @@ CREATE TABLE IF NOT EXISTS review_decisions (
 
 CREATE TABLE IF NOT EXISTS jobs (
     id          TEXT PRIMARY KEY,
-    type        TEXT NOT NULL CHECK (type IN ('extract_pdf', 'detect')),
+    type        TEXT NOT NULL CHECK (type IN ('extract_pdf', 'extract_image', 'detect')),
     status      TEXT NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'running', 'done', 'failed')),
     payload     JSONB NOT NULL DEFAULT '{}',
@@ -71,6 +72,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TIMESTAMPTZ
 );
 
+CREATE TABLE IF NOT EXISTS tuning (
+    id               TEXT PRIMARY KEY,
+    active           BOOLEAN NOT NULL DEFAULT FALSE,
+    weights          JSONB NOT NULL,
+    bias             REAL NOT NULL,
+    flag_threshold   REAL NOT NULL,
+    review_threshold REAL NOT NULL,
+    n_decisions      INTEGER NOT NULL,
+    train_metrics    JSONB,
+    eval_metrics     JSONB,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tuning_single_active ON tuning (active) WHERE active;
+
 CREATE INDEX IF NOT EXISTS idx_invoice_pairs_label ON invoice_pairs (label);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status);
 
@@ -79,6 +95,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status);
 -- ingestion (PDF upload) leaves them NULL.
 ALTER TABLE invoices ADD COLUMN IF NOT EXISTS duplicate_of TEXT;
 ALTER TABLE invoices ADD COLUMN IF NOT EXISTS variant TEXT;
+
+-- Phase 4 widens the queue to image uploads; existing databases get the
+-- widened constraint on the next init-db run.
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_type_check
+    CHECK (type IN ('extract_pdf', 'extract_image', 'detect'));
 """
 
 
@@ -451,6 +473,66 @@ def upsert_review_decision(
         row = cur.fetchone()
     conn.commit()
     return row
+
+
+def all_review_decisions(conn: psycopg.Connection) -> dict[frozenset, str]:
+    """All persisted decisions keyed by unordered invoice pair (Phase 4 input)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id_a, id_b, decision FROM review_decisions")
+        return {frozenset((r["id_a"], r["id_b"])): r["decision"] for r in cur.fetchall()}
+
+
+# --- tuning (Phase 4) -----------------------------------------------------------
+
+
+def insert_tuning(conn: psycopg.Connection, model) -> str:
+    """Persist a TunedModel row (inactive until ``activate_tuning`` is called)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO tuning (id, active, weights, bias, flag_threshold,
+                                review_threshold, n_decisions,
+                                train_metrics, eval_metrics)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                model.model_id,
+                False,
+                Jsonb(model.weights),
+                model.bias,
+                model.flag_threshold,
+                model.review_threshold,
+                model.n_decisions,
+                Jsonb(model.train_metrics) if model.train_metrics else None,
+                Jsonb(model.eval_metrics) if model.eval_metrics else None,
+            ),
+        )
+    conn.commit()
+    return model.model_id
+
+
+def activate_tuning(conn: psycopg.Connection, model_id: str) -> None:
+    """Activate one tuning row (deactivating any other) in one transaction."""
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute("UPDATE tuning SET active = FALSE WHERE active")
+            cur.execute("UPDATE tuning SET active = TRUE WHERE id = %s", (model_id,))
+    conn.commit()
+
+
+def deactivate_tuning(conn: psycopg.Connection) -> int:
+    """Deactivate all tuning models; returns how many were active."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE tuning SET active = FALSE WHERE active")
+        n = cur.rowcount
+    conn.commit()
+    return n
+
+
+def get_active_tuning(conn: psycopg.Connection) -> dict | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM tuning WHERE active ORDER BY created_at DESC LIMIT 1")
+        return cur.fetchone()
 
 
 # --- jobs ---------------------------------------------------------------------

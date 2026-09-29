@@ -3,8 +3,12 @@
 The queue is a PostgreSQL table claimed with ``FOR UPDATE SKIP LOCKED``: this
 keeps exactly-once processing semantics with several workers while avoiding an
 extra message-broker dependency (see DESIGN.md decision log). Job payloads are
-small (base64-encoded PDFs, capped by the API), so the database doubles as the
-message store.
+small (base64-encoded documents, capped by the API), so the database doubles
+as the message store.
+
+Extraction routing follows charter decision D6: PDFs with a text layer go to
+pdfplumber; text-less PDFs and images go to the vision-LLM layer (mock mode
+by default, real API opt-in via environment).
 """
 from __future__ import annotations
 
@@ -13,28 +17,47 @@ import time
 
 import psycopg
 
-from . import db, extraction
+from . import db, extraction, vision
 from .engine import detect
 from .models import PASS
 
 
-def handle_extract_pdf(conn: psycopg.Connection, payload: dict) -> dict:
+def _vision_method() -> str:
+    return "vision_llm_api" if vision.vision_mode() == "api" else "vision_llm_mock"
+
+
+def _extract_dispatch(data: bytes) -> tuple[extraction.ExtractionResult, str, str]:
+    """Route a document to the right extractor; return (result, method, source_type)."""
+    if data.startswith(b"%PDF-"):
+        result = extraction.extract_pdf(data)
+        if result.raw_text.strip():
+            return result, "pdfplumber", "pdf"
+        return vision.extract_image(data, "application/pdf"), _vision_method(), "pdf"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return vision.extract_image(data, "image/png"), _vision_method(), "image"
+    if data[:3] == b"\xff\xd8\xff":
+        return vision.extract_image(data, "image/jpeg"), _vision_method(), "image"
+    raise ValueError("unsupported document type (not a PDF, PNG, or JPEG)")
+
+
+def handle_extract_document(conn: psycopg.Connection, payload: dict) -> dict:
     data = base64.b64decode(payload["data"])
-    result = extraction.extract_pdf(data)
+    result, method, source_type = _extract_dispatch(data)
     invoice_id = db.new_id("inv")
     invoice = extraction.result_to_invoice(result, invoice_id)
     db.insert_invoice(
         conn,
         invoice,
-        source_type="pdf",
+        source_type=source_type,
         source_name=payload.get("name", ""),
         raw_text=result.raw_text,
-        extraction_method="pdfplumber",
+        extraction_method=method,
         extraction_confidence=result.confidence,
     )
     detect_job = db.create_job(conn, "detect", {"trigger": invoice_id})
     return {
         "invoice_id": invoice_id,
+        "extraction_method": method,
         "confidence": result.confidence,
         "missing": result.missing,
         "detect_job_id": detect_job,
@@ -44,18 +67,35 @@ def handle_extract_pdf(conn: psycopg.Connection, payload: dict) -> dict:
 def handle_detect(conn: psycopg.Connection, payload: dict) -> dict:
     invoices = db.load_invoices(conn)
     result = detect(invoices)
-    db.replace_pairs(conn, result.pairs)
+    pairs = result.pairs
+    active = db.get_active_tuning(conn)
+    if active is not None:
+        from .normalize import normalize_invoice
+        from .tuning import TunedModel, rescore_pairs
+
+        periods = {inv.id: normalize_invoice(inv).billing_period for inv in invoices}
+        model = TunedModel(
+            weights=dict(active["weights"]),
+            bias=active["bias"],
+            flag_threshold=active["flag_threshold"],
+            review_threshold=active["review_threshold"],
+            n_decisions=active["n_decisions"],
+            model_id=active["id"],
+        )
+        pairs = rescore_pairs(pairs, model, periods)
+    db.replace_pairs(conn, pairs)
+    counts = {label: sum(1 for p in pairs if p.label == label) for label in ("flag", "review", PASS)}
     return {
         "n_invoices": len(invoices),
-        "n_pairs": len(result.pairs),
-        "flagged": result.stats.get("flagged", 0),
-        "review": result.stats.get("review", 0),
-        "pass": sum(1 for p in result.pairs if p.label == PASS),
+        "n_pairs": len(pairs),
+        "tuned": active["id"] if active else None,
+        **counts,
     }
 
 
 _HANDLERS = {
-    "extract_pdf": handle_extract_pdf,
+    "extract_pdf": handle_extract_document,
+    "extract_image": handle_extract_document,
     "detect": handle_detect,
 }
 

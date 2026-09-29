@@ -113,26 +113,29 @@ per variant class, and review-queue load. Current reference run (seed 42, 10,200
 invoices): **P 0.9852 / R 1.0000 / F1 0.9926**, 3 FP (all same-vendor+amount ≤14d
 re-invoice-pattern pairs — genuinely ambiguous without `billing_period`).
 
-## 6. PDF ingestion (Phase 2)
+## 6. Document ingestion (Phase 2, vision fallback in Phase 4)
 
 The deterministic, primary extraction path of decision D6: PDFs with a text layer are
-parsed locally with **pdfplumber**. The vision-LLM fallback for scans/photos is Phase 4
-and must not leak into this path.
+parsed locally with **pdfplumber**. Text-less PDFs and images (scans, phone photos) go
+to the vision-LLM fallback (Phase 4).
 
 ```
-PDF bytes
-   │  extraction.extract_pdf()
-   ▼
-raw text ──────────────────────────► stored verbatim (audit trail, invoices.raw_text)
-   │  parse_fields()                  label-based, conservative
+upload (PDF | PNG | JPEG)
+   │  worker._extract_dispatch()
+   ├─ PDF with text layer ──►  pdfplumber                     (primary, D6)
+   ├─ PDF without text    ──►  vision.extract_image()         (fallback, D6)
+   └─ image (PNG/JPEG)    ──►  vision.extract_image()         (fallback, D6)
+   │
+raw response ──────────────►  stored verbatim (audit trail, invoices.raw_text)
+   │  parse_fields() or vision.validate_extraction()
    ▼
 fields (vendor, number, amount, date, tax id)
-   │  result_to_invoice()             missing fields stay empty, never guessed
+   │  result_to_invoice()      missing fields stay empty, never guessed
    ▼
 Invoice → normalization → detection (unchanged Phase 1 engine)
 ```
 
-Parser rules:
+Parser rules (pdfplumber path):
 - Field lines must carry an explicit label (`Vendor:`, `Invoice No:`, `Invoice Date:`,
   `Amount Due:`/`Total:`, `Tax ID:`/`VAT:`); unstructured text is ignored.
 - `Invoice No` and `Invoice Date` labels are disambiguated, and amounts reuse the
@@ -140,14 +143,45 @@ Parser rules:
 - Dates accept ISO, `14 Sep 2026`, `September 14, 2026`, and `14/09/2026` forms.
 - **Extraction confidence** = fraction of the 4 core fields found (vendor, number,
   amount, date). It is persisted per invoice and reported by the API; missing fields
-  are listed explicitly. Known limitation (honest, by design): the label parser covers
-  structured invoice documents; arbitrary layouts need the Phase 4 fallback.
+  are listed explicitly.
+
+### 6.1 Vision-LLM fallback (Phase 4)
+
+`vision.py` implements the D6 fallback with two clients behind one contract:
+
+- **Mock** (default, offline): reads fixture photos with the embedded-font recognizer
+  (`ocr.py`, see below) and emits the same JSON a real model would. CI, tests, and
+  demos never touch the network. Photos it cannot read produce null fields with
+  confidence 0 — the honest behavior of a blind model, never guessed fields.
+- **Real** (opt-in): set `DEDUPE_VISION_LLM_URL` (plus optional
+  `DEDUPE_VISION_LLM_MODEL`, `DEDUPE_VISION_LLM_API_KEY`) to call an
+  OpenAI-compatible `/chat/completions` endpoint with the image as a base64 data
+  URL. Built with stdlib `urllib` — **zero new runtime dependencies**. The prompt
+  demands JSON-only output with the schema below and `null` for unreadable fields.
+
+Extraction JSON schema (validated by `vision.validate_extraction`, no `jsonschema`
+dependency): `vendor_name`/`invoice_no`/`tax_id` (string or null), `invoice_date`
+(recognizable date string or null), `amount` (number or numeric string or null),
+`extraction_confidence` (number in [0, 1], the model's own confidence). Schema
+violations raise `VisionLLMError` and fail the job — bad model output never reaches
+the engine. Stored **extraction confidence** = model confidence × core-field
+completeness. The raw response is kept verbatim in `invoices.raw_text` (audit trail,
+charter §4); `extraction_method` records `pdfplumber` | `vision_llm_mock` |
+`vision_llm_api`.
+
+Mock OCR (`ocr.py`): fixture photos (`photogen.py`) render labeled invoice text from
+the same embedded 5×7 bitmap font, degraded deterministically (specks, per-line
+jitter, glyph wobble, brightness gradient — "crumpled phone photo"). The recognizer
+binarizes, removes speck noise, segments lines/glyphs by ink projection, and matches
+each glyph against font templates by XOR distance at the matched scale. It is
+deliberately not a general OCR: arbitrary photos yield few labels and low confidence,
+which flows through the same missing-field reporting as a weak real model.
 
 ## 7. Service architecture (Phase 2, web app in Phase 3)
 
 ```
 ┌─────────┐  POST /invoices/pdf   ┌──────────┐  jobs table   ┌────────┐
-│ client  │ ────────────────────► │ FastAPI  │ ────────────► │ worker │
+│ client  │  POST /invoices/photo │ FastAPI  │ ────────────► │ worker │
 │ (web UI)│ ◄───── JSON API ──────│  (api)   │               │(worker)│
 └─────────┘                       └────┬─────┘               └───┬────┘
                                        │        PostgreSQL       │ pdfplumber
@@ -221,6 +255,62 @@ bulk-inserts it with ground truth, and runs detection synchronously, so the app
 has a realistic review queue (203 flagged / 483 review pairs) within seconds —
 no hand-crafted PDFs needed, fully offline.
 
+### 7.2 Feedback loop (Phase 4)
+
+Reviewer decisions in `review_decisions` drive threshold and weight tuning
+(`tuning.py`, CLI `invoice-dedupe simulate-feedback` + `invoice-dedupe tune`).
+
+**Training data**: only pairs a reviewer could see (base flag/review zones) with
+their verdicts. `simulate-feedback` answers every such pair from the seeded
+ground truth (duplicate iff GT pair, reviewer `simulated`) — the acceptance
+criterion's "simulated feedback".
+
+**Feature vector** (from the pair breakdown): invoice-no, vendor, amount, date
+similarities, plus `billing_period_match` (stored in every breakdown since
+Phase 4) and two re-invoice-rule interactions (`rule × same-period`,
+`rule × diff-period`). The tax-ID check stays a hard rule, not a feature.
+
+**Model**: logistic regression, sum-loss batch gradient descent with three
+deliberate constraints, each validated against the seeded dataset before
+shipping:
+
+1. *Pinned weights*: vendor (0.25) and amount (0.30) never move — reviewed
+   pairs have no variance in them (same vendor ⇒ same identifiers), so
+   learning them would fit noise. The tax-ID mismatch cap is re-applied
+   adaptively (below the tuned review threshold), preserving the base rule's
+   semantics.
+2. *Prior-anchored learning*: only the identifiable weights (invoice no, date,
+   billing period, rule interactions) move, pulled toward the deployed values
+   by a Gaussian prior — decisions adjust a validated model instead of
+   rebuilding one from ~700 decisions.
+3. *Global re-scoring*: when a tuning row is active, every `detect` run (and
+   `tune`) re-scores **all** pairs with the tuned model, so the stored `score`
+   column keeps one coherent meaning. The dashboard defaults its threshold to
+   the active model's flag threshold; `/metrics` exposes the active model.
+
+**Threshold selection** happens on decision labels only — F1 for the flag
+threshold (auto-blocked payments demand precision), F2 for the review
+threshold (the queue tolerates false alarms to keep recall high).
+
+**Measured result** (seed 42, 10,200 invoices; `invoice-dedupe tune` output):
+
+| | P | R | F1 | FP | flagged | review queue |
+|---|---|---|---|---|---|---|
+| before | 0.9852 | 1.0000 | 0.9926 | 3 | 203 | 483 |
+| after | 0.9852 | 1.0000 | 0.9926 | 3 | 203 | **0** |
+
+The measurable improvement is operational: the reviewer queue is eliminated at
+identical detection quality (precision, recall, exposure all unchanged). The
+learned weights separate recurring-billing collisions (same vendor + amount,
+~30-day gaps) from true duplicates via date and billing period.
+
+**Honest false-positive statement**: the 3 remaining FPs are not removable by
+any model over the available features. All 3 are re-invoice-rule fires whose
+dates cross a month boundary (`diff_period_notdup: 3`); the dataset also
+contains 11 true re-invoice duplicates with the identical profile
+(`diff_period_dup: 11`) — same vendor, same amount, different number, ≤14-day
+gap across a month boundary. `tune` prints this analysis on every run.
+
 ## 8. Data model
 
 Phase 1 (in-memory + JSONL):
@@ -235,12 +325,16 @@ PairResult       id_a, id_b, score, label, breakdown (per-field similarities + r
 Phase 2 (PostgreSQL): `invoices` (parsed columns + `raw_text`,
 `extraction_method`, `extraction_confidence`; Phase 3 adds nullable
 `duplicate_of` / `variant` ground-truth columns, populated only by
-`seed-demo`), `invoice_pairs` (`score`, `label`, `breakdown` JSONB),
-`review_decisions` (`duplicate` / `not_duplicate`, feeds Phase 4), `jobs`
-(`extract_pdf` / `detect`, statuses `pending → running → done|failed`).
-`review_decisions` currently records verdicts; acting on them (threshold
-tuning) is Phase 4. Phase 3 reads these tables read-only through
-`GET /metrics` and the enriched `GET /pairs`.
+`seed-demo`), `invoice_pairs` (`score`, `label`, `breakdown` JSONB — Phase 4
+adds `billing_period_match` to every breakdown and a `tuned` audit sub-object
+when a tuned model produced the score), `review_decisions`
+(`duplicate` / `not_duplicate`), `jobs` (`extract_pdf` / `extract_image` /
+`detect`, statuses `pending → running → done|failed`), and Phase 4's
+`tuning` (one row per fitted model: weights, bias, thresholds, decision
+counts, before/after metrics, `active` flag kept unique by a partial index).
+Phase 3 reads these tables read-only through `GET /metrics` and the enriched
+`GET /pairs`; Phase 4's `tune` command writes the `tuning` table and
+`simulate-feedback` writes `review_decisions`.
 
 ## 9. Decision log
 
@@ -265,3 +359,9 @@ tuning) is Phase 4. Phase 3 reads these tables read-only through
 | 2026-09-28 | `seed-demo` command + nullable `invoices.duplicate_of`/`variant` columns | The dashboard's threshold slider needs a precision number that is honest at any position, which requires labeled pairs; persisting the synthetic ground truth makes the demo measurable (P/R at any threshold) instead of decorative. Columns are NULL for regular PDF ingestion, so production behavior is unchanged. Detection is re-run synchronously in the seed command (~1.3 s at 10k) — no worker round-trip needed. |
 | 2026-09-28 | `GET /metrics` returns the full scored distribution; the server also computes `at_threshold` | The slider must update live for arbitrary thresholds; shipping raw per-pair rows (score, GT flag, exposure, decision — ~4.5 kB/1k pairs) lets the client recompute instantly. The server-side `at_threshold` block (`metrics.threshold_metrics`) is the unit-tested source of truth, so UI and API cannot drift far. Precision is reported as *measured* (vs seeded GT) or *estimated* (review decisions only) and never conflated. |
 | 2026-09-28 | `GET /pairs` enriched with both invoices' fields + stored decision instead of client-side N+1 fetches | The review queue renders a comparison from one request; at 100+ queued pairs, per-invoice fetches would triple latency and complicate the UI for no benefit. |
+| 2026-09-28 | Vision-LLM client with stdlib `urllib`, zero new runtime dependencies | The real path is one JSON POST to an OpenAI-compatible endpoint with a base64 data URL; an SDK (openai/anthropic) would add a dependency for a single call and pin API shapes we do not control anyway. The request/response contract lives in ~40 testable lines (`build_request`, response unwrapping, error wrapping), and tests inject a fake `urlopen` — no network. |
+| 2026-09-28 | Mock vision mode reads pixels: embedded 5×7 bitmap font + template-matching recognizer (`photogen.py`, `ocr.py`) instead of canned responses | Charter D6 demands mock mode so CI and demos never hit the network, and honesty demands the mock not invent fields. Rendering fixture photos from the same font the recognizer matches against makes the extraction *real* (image → pixels → fields), deterministic, and offline, while arbitrary photos honestly degrade to missing fields + confidence 0. `photogen` is the `pdfgen` pattern extended to PNG (stdlib `zlib` only). Punctuation is rendered without wobble because a ±1 px shift genuinely blurs a comma into a period at fixture resolution. |
+| 2026-09-28 | `billing_period_match` stored in every pair breakdown (feature, not score component) | Phase 4's tuner needs the one feature that separates recurring-billing false positives from re-invoice duplicates. Base scoring is untouched (demo metrics byte-identical); the breakdown is additive so the Phase 3 UI and stored pairs stay compatible. |
+| 2026-09-28 | Tuner: pinned vendor/amount + tax-cap reapplication + prior-anchored learning + global re-scoring (see §7.2) | Validated against the seeded dataset before shipping: unpinned fits collapsed vendor/amount to ≈0 (no variance among reviewed pairs) and leaked cross-vendor pairs into the flag zone (P fell to 0.05 in one offline variant); a pass-slice-only re-rank was rejected because it leaves two score scales in one column, breaking the dashboard and evaluation semantics. Pinned weights + global re-score measured clean: zero label migration out of the pass zone, queue 483 → 0 at identical P/R/F1. |
+| 2026-09-28 | `simulate-feedback` command: simulated reviewer answers from seeded GT | The acceptance criterion ("thresholds improve measurably after simulated feedback") needs reproducible reviewer input; a perfect reviewer over the visible queue (flag/review pairs) is the honest upper bound and exercises the exact persistence path the UI uses. |
+| 2026-09-28 | `/metrics` defaults its threshold to the active tuned model's flag threshold | After tuning, pair scores live in the tuned model's scale; keeping 0.90 as the implicit default would misreport flagged count/recall. Explicit `?flag_threshold=` still wins; the UI re-inits its slider from the tuning payload. |
