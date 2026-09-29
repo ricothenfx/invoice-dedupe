@@ -18,10 +18,17 @@ Endpoints (Phase 3, charter §5):
 
 Uploads are asynchronous: the API only validates and enqueues; workers do the
 extraction and detection (see worker.py).
+
+**Serverless mode** (``DEDUPE_SERVERLESS=1``, used by the Vercel deployment):
+there is no separate worker process, so the upload handlers drain the queue
+inline (extract + chained detect) before responding. The response contract is
+unchanged; ``status`` simply arrives as ``done``/``failed`` instead of
+``pending``.
 """
 from __future__ import annotations
 
 import base64
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -70,6 +77,27 @@ def _conn() -> psycopg.Connection:
     return db.connect()
 
 
+def serverless_mode() -> bool:
+    """``True`` when running without a separate worker (``DEDUPE_SERVERLESS=1``)."""
+    return os.environ.get("DEDUPE_SERVERLESS", "").lower() not in ("", "0", "false")
+
+
+def _process_queue_inline(conn: psycopg.Connection) -> None:
+    """Drain the job queue in-process (serverless mode; no worker deployment)."""
+    from . import worker  # deferred: keeps the engine stack off cold starts of read paths
+
+    worker.process_all_pending(conn)
+
+
+def _job_status(job_id: str) -> str:
+    """Current status of a job; ``pending`` when it was not processed yet."""
+    if not serverless_mode():
+        return "pending"
+    with _conn() as conn:
+        job = db.get_job(conn, job_id)
+    return job["status"] if job else "pending"
+
+
 @app.get("/health")
 def health() -> dict:
     try:
@@ -94,7 +122,9 @@ async def upload_pdf(
     payload = {"data": base64.b64encode(data).decode("ascii"), "name": file.filename or ""}
     with _conn() as conn:
         job_id = db.create_job(conn, "extract_pdf", payload)
-    return {"job_id": job_id, "status": "pending"}
+        if serverless_mode():
+            _process_queue_inline(conn)
+    return {"job_id": job_id, "status": _job_status(job_id)}
 
 
 @app.post("/invoices/photo", status_code=202)
@@ -119,7 +149,9 @@ async def upload_photo(
     payload = {"data": base64.b64encode(data).decode("ascii"), "name": file.filename or ""}
     with _conn() as conn:
         job_id = db.create_job(conn, "extract_image", payload)
-    return {"job_id": job_id, "status": "pending"}
+        if serverless_mode():
+            _process_queue_inline(conn)
+    return {"job_id": job_id, "status": _job_status(job_id)}
 
 
 @app.get("/jobs/{job_id}")

@@ -110,8 +110,15 @@ def database_url() -> str:
 
 
 def connect(url: str | None = None) -> psycopg.Connection:
-    """Open a connection with dict rows by default."""
-    return psycopg.connect(url or database_url(), row_factory=dict_row)
+    """Open a connection with dict rows by default.
+
+    Server-side prepared statements are disabled: serverless deployments sit
+    behind transaction-pooling proxies (e.g. Neon's PgBouncer) where they are
+    not safe. The cost is negligible at this scale (see DESIGN.md §9).
+    """
+    conn = psycopg.connect(url or database_url(), row_factory=dict_row)
+    conn.prepare_threshold = None
+    return conn
 
 
 def init_schema(conn: psycopg.Connection) -> None:

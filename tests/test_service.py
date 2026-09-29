@@ -346,3 +346,60 @@ def test_simulate_feedback_and_tune_improves_review_queue(client):
     assert reset["tuning"] is None
     assert reset["label_counts"]["flag"] == before["label_counts"]["flag"]
     assert reset["label_counts"].get("review", 0) == before["label_counts"].get("review", 0)
+
+
+# --- Serverless mode (DEDUPE_SERVERLESS=1): inline queue drain, no worker ----
+
+
+@pytest.fixture()
+def serverless_client(client, monkeypatch):
+    monkeypatch.setenv("DEDUPE_SERVERLESS", "1")
+    yield client
+
+
+def test_serverless_upload_processes_inline(serverless_client):
+    """Without a worker deployment, uploads return with the job already done
+    and the chained detect job applied — same contract, immediate status."""
+    resp = serverless_client.post(
+        "/invoices/pdf", files={"file": ("a.pdf", pdfgen.make_pdf(INVOICE_A), "application/pdf")}
+    )
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "done"
+    job = serverless_client.get(f"/jobs/{resp.json()['job_id']}").json()
+    assert job["status"] == "done"
+    assert job["result"]["extraction_method"] == "pdfplumber"
+
+    # the chained detect job ran too: the second upload is flagged immediately
+    resp_b = serverless_client.post(
+        "/invoices/pdf", files={"file": ("b.pdf", pdfgen.make_pdf(INVOICE_B), "application/pdf")}
+    )
+    assert resp_b.json()["status"] == "done"
+    flagged = serverless_client.get("/pairs", params={"label": "flag"}).json()
+    assert flagged, "expected inline detection to flag the duplicate"
+    assert all(p["score"] >= 0.90 for p in flagged)
+
+
+def test_serverless_photo_processes_inline(serverless_client):
+    photo = photogen.make_photo(
+        vendor="Northwind Logistics, Ltd.",
+        invoice_no="INV-2026-0001",
+        invoice_date="2026-09-14",
+        amount="12,500.00",
+        tax_id="12-3456789",
+        seed=3,
+    )
+    resp = serverless_client.post(
+        "/invoices/photo", files={"file": ("a.png", photo, "image/png")}
+    )
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "done"
+    invoices = serverless_client.get("/invoices").json()
+    assert {inv["extraction_method"] for inv in invoices} == {"vision_llm_mock"}
+
+
+def test_serverless_mode_disabled_by_default(client):
+    """Without the env flag the contract is unchanged: jobs stay pending."""
+    resp = client.post(
+        "/invoices/pdf", files={"file": ("a.pdf", pdfgen.make_pdf(INVOICE_A), "application/pdf")}
+    )
+    assert resp.json()["status"] == "pending"

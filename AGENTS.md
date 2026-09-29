@@ -66,6 +66,8 @@ are skipped when it is unset.
 src/invoice_dedupe/   engine package (normalize, scoring, blocking, engine, synth,
                       evaluate, dataset, cli, models, metrics) + service layer
                       (extraction, pdfgen, db, worker, api, webapp/)
+app.py                Vercel serverless entrypoint (exposes the FastAPI app)
+vercel.json           serverless function config (maxDuration, excluded files)
 tests/                pytest suite (integration tests need DEDUPE_TEST_DATABASE_URL)
 docs/                 PROJECT_CHARTER.md, DESIGN.md
 datasets/             generated artifacts (git-ignored)

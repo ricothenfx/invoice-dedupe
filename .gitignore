@@ -6,3 +6,7 @@ dist/
 .venv*/
 .pytest_cache/
 datasets/
+.env
+.env.*
+.vercel
+.env*

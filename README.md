@@ -160,6 +160,35 @@ DEDUPE_VISION_LLM_MODEL=gpt-4o-mini \
 DEDUPE_VISION_LLM_API_KEY=... invoice-dedupe worker
 ```
 
+### Deploy to Vercel (serverless)
+
+The service also deploys to Vercel as a Python serverless function — no code
+changes at deploy time, one behavior switch:
+
+- `app.py` exposes the FastAPI app to Vercel's Python runtime (detected from
+  `pyproject.toml`; entrypoint conventions documented at vercel.com/docs).
+- With `DEDUPE_SERVERLESS=1`, upload handlers drain the job queue inline
+  (extraction + chained detection) before responding — there is no separate
+  worker process in serverless. Responses keep the same shape; `status`
+  arrives `done`/`failed` instead of `pending`. Without the flag, nothing
+  changes: local `serve` + `worker` mode stays fully asynchronous.
+- `db.connect()` disables server-side prepared statements so the app works
+  behind transaction-pooling proxies (e.g. Neon's PgBouncer).
+
+```bash
+npm i -g vercel && vercel login
+vercel link                                  # once per clone
+vercel env add DEDUPE_DATABASE_URL           # Neon/Supabase/... PostgreSQL URL
+vercel env add DEDUPE_SERVERLESS production  # value: 1
+# seed the hosted database from your machine (CLI talks to any PostgreSQL):
+DEDUPE_DATABASE_URL=postgres://... invoice-dedupe init-db
+DEDUPE_DATABASE_URL=postgres://... invoice-dedupe seed-demo --n 10000 --seed 42
+vercel deploy --prod
+```
+
+The seeded dashboard, review queue, and uploads then work at your deployment
+URL; attach a custom domain from the Vercel dashboard (or `vercel alias`).
+
 The web app (served at `/`, fully offline — assets vendored, no CDN):
 
 - **Dashboard** — flag-threshold slider with live flagged count, precision and
